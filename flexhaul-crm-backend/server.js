@@ -20,6 +20,7 @@ const documentRoutes = require("./routes/documents");
 const invoiceRoutes = require("./routes/invoices");
 const timeSlotsRoutes = require("./routes/timeSlots");
 const publicInquiriesRoutes = require("./routes/publicInquiries");
+const priceCatalogRoutes = require("./routes/priceCatalog");
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -59,6 +60,7 @@ app.use("/api/equipment", requireAuth, equipmentRoutes);
 app.use("/api/documents", requireAuth, documentRoutes);
 app.use("/api/invoices", requireAuth, invoiceRoutes);
 app.use("/api/time-slots", requireAuth, timeSlotsRoutes);
+app.use("/api/price-catalog", requireAuth, priceCatalogRoutes);
 
 // attach req.user inside routes that log activity — the requireAuth
 // middleware above already sets it before these routers run.
