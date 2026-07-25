@@ -20,6 +20,7 @@ const documentRoutes = require("./routes/documents");
 const invoiceRoutes = require("./routes/invoices");
 const timeSlotsRoutes = require("./routes/timeSlots");
 const publicInquiriesRoutes = require("./routes/publicInquiries");
+const publicShareRoutes = require("./routes/publicShare");
 const priceCatalogRoutes = require("./routes/priceCatalog");
 
 const app = express();
@@ -45,10 +46,12 @@ app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
 // Only /api/auth/login is unauthenticated (checked inside auth.js itself),
-// PLUS /api/public/inquiries — that one's called directly from the public
-// website's quote form, before anyone has logged into anything.
+// PLUS /api/public/inquiries and /api/public/* (share links) — those are
+// called directly from the public website or a texted/emailed link,
+// before anyone has logged into anything.
 app.use("/api/auth", authRoutes);
 app.use("/api/public/inquiries", publicInquiriesRoutes);
+app.use("/api/public", publicShareRoutes);
 
 app.use("/api/dashboard", requireAuth, dashboardRoutes);
 app.use("/api/customers", requireAuth, customerRoutes);

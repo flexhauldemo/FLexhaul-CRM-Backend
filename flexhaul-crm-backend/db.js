@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS deals (
   customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
   stage TEXT NOT NULL DEFAULT 'new_lead', -- new_lead | quoted | won | scheduled | complete | invoiced | lost
   source TEXT, -- 'website' | 'phone' | 'referral' | 'furniture_store' | 'other'
+  service_type TEXT, -- 'junk_removal' | 'furniture_pickup' | 'light_demolition' | 'other' — powers revenue-by-service reporting
   estimated_value REAL DEFAULT 0,
   notes TEXT, -- what the customer actually asked for — filled in automatically for website inquiries
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -61,6 +62,8 @@ CREATE TABLE IF NOT EXISTS estimates (
   line_items TEXT NOT NULL DEFAULT '[]', -- JSON array: [{type,label,qty,unit,rate,amount}]
   total REAL NOT NULL DEFAULT 0,
   accepted INTEGER NOT NULL DEFAULT 0, -- set to 1 by POST /api/estimates/:id/accept, which also auto-creates a job + invoice
+  share_token TEXT, -- random token letting a customer view/approve this exact estimate with no login — see routes/publicShare.js
+  customer_approved_at TEXT, -- set when the customer approves via the public link, as opposed to staff clicking Accept
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -90,6 +93,10 @@ CREATE TABLE IF NOT EXISTS jobs (
   equipment_ids TEXT NOT NULL DEFAULT '[]', -- JSON array of equipment ids
   notes TEXT,
   google_event_id TEXT, -- links this job to an event on the shared Google Calendar, if calendar sync is configured
+  actual_cost REAL, -- what the job really cost (crew hours, disposal fees, fuel, etc.) — set once complete, compared against the estimate for real margin
+  recurring_interval TEXT, -- 'weekly' | 'biweekly' | 'monthly' | NULL — set to auto-generate the next job when this one is marked complete
+  recurrence_parent_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL, -- points back to the job that spawned this one, so a recurring chain is traceable
+  review_requested INTEGER NOT NULL DEFAULT 0, -- set once a review request has gone out for this job, so it's never asked for twice
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -100,6 +107,7 @@ CREATE TABLE IF NOT EXISTS documents (
   type TEXT NOT NULL DEFAULT 'photo', -- 'permit' | 'environmental_survey' | 'coi' | 'photo' | 'other'
   file_url TEXT NOT NULL,
   original_name TEXT,
+  expires_at TEXT, -- for permit/COI compliance tracking — the dashboard flags anything expiring soon
   uploaded_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -107,8 +115,12 @@ CREATE TABLE IF NOT EXISTS invoices (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
   amount REAL NOT NULL DEFAULT 0,
+  line_items TEXT NOT NULL DEFAULT '[]', -- snapshot of the source estimate's line items at invoice time — a copy, not a live reference, so editing/deleting the estimate later never changes what was actually billed
   status TEXT NOT NULL DEFAULT 'unpaid', -- 'unpaid' | 'paid' | 'overdue'
   due_date TEXT,
+  share_token TEXT, -- lets a customer view/pay this exact invoice with no login
+  stripe_payment_link TEXT, -- cached Stripe Checkout URL, only ever set if STRIPE_SECRET_KEY is configured
+  stripe_session_id TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   paid_at TEXT
 );
@@ -161,6 +173,63 @@ const estimatesColumns = db.prepare("PRAGMA table_info(estimates)").all().map((c
 if (!estimatesColumns.includes("accepted")) {
   db.exec("ALTER TABLE estimates ADD COLUMN accepted INTEGER NOT NULL DEFAULT 0;");
 }
+
+const invoicesColumns = db.prepare("PRAGMA table_info(invoices)").all().map((c) => c.name);
+if (!invoicesColumns.includes("line_items")) {
+  db.exec("ALTER TABLE invoices ADD COLUMN line_items TEXT NOT NULL DEFAULT '[]';");
+}
+if (!invoicesColumns.includes("stripe_payment_link")) {
+  db.exec("ALTER TABLE invoices ADD COLUMN stripe_payment_link TEXT;");
+}
+if (!invoicesColumns.includes("stripe_session_id")) {
+  db.exec("ALTER TABLE invoices ADD COLUMN stripe_session_id TEXT;");
+}
+if (!invoicesColumns.includes("share_token")) {
+  db.exec("ALTER TABLE invoices ADD COLUMN share_token TEXT;");
+}
+
+const dealsColumns2 = db.prepare("PRAGMA table_info(deals)").all().map((c) => c.name);
+if (!dealsColumns2.includes("service_type")) {
+  db.exec("ALTER TABLE deals ADD COLUMN service_type TEXT;");
+}
+
+const estimatesColumns2 = db.prepare("PRAGMA table_info(estimates)").all().map((c) => c.name);
+if (!estimatesColumns2.includes("share_token")) {
+  db.exec("ALTER TABLE estimates ADD COLUMN share_token TEXT;");
+}
+if (!estimatesColumns2.includes("customer_approved_at")) {
+  db.exec("ALTER TABLE estimates ADD COLUMN customer_approved_at TEXT;");
+}
+
+const jobsColumns2 = db.prepare("PRAGMA table_info(jobs)").all().map((c) => c.name);
+if (!jobsColumns2.includes("actual_cost")) {
+  db.exec("ALTER TABLE jobs ADD COLUMN actual_cost REAL;");
+}
+if (!jobsColumns2.includes("recurring_interval")) {
+  db.exec("ALTER TABLE jobs ADD COLUMN recurring_interval TEXT;");
+}
+if (!jobsColumns2.includes("recurrence_parent_id")) {
+  db.exec("ALTER TABLE jobs ADD COLUMN recurrence_parent_id INTEGER;");
+}
+if (!jobsColumns2.includes("review_requested")) {
+  db.exec("ALTER TABLE jobs ADD COLUMN review_requested INTEGER NOT NULL DEFAULT 0;");
+}
+
+const documentsColumns = db.prepare("PRAGMA table_info(documents)").all().map((c) => c.name);
+if (!documentsColumns.includes("expires_at")) {
+  db.exec("ALTER TABLE documents ADD COLUMN expires_at TEXT;");
+}
+
+// Backfill share_token for any estimates created before this feature
+// existed, so the public link works for old data too, not just new.
+db.exec(`
+  UPDATE estimates SET share_token = lower(hex(randomblob(16)))
+  WHERE share_token IS NULL;
+`);
+db.exec(`
+  UPDATE invoices SET share_token = lower(hex(randomblob(16)))
+  WHERE share_token IS NULL;
+`);
 
 // Auto-seed the price catalog on first boot — this is what lets the
 // estimate builder offer "pick from a list" instead of typing every line
