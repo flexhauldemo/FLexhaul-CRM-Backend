@@ -26,12 +26,20 @@ const priceCatalogRoutes = require("./routes/priceCatalog");
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-// CORS: restrict to your actual site origin in production via ALLOWED_ORIGIN.
+// CORS: restrict to your actual site origin(s) in production via
+// ALLOWED_ORIGIN. Supports a comma-separated list, so you can allow both
+// your real domain and your old *.netlify.app URL at the same time
+// during a domain transition — e.g.
+//   ALLOWED_ORIGIN=https://flexhauldemo.com,https://flexhaul.netlify.app
 // Left open during local development if that variable isn't set.
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN;
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
 app.use(
   cors({
-    origin: ALLOWED_ORIGIN || true,
+    origin: ALLOWED_ORIGINS.length > 0 ? ALLOWED_ORIGINS : true,
     credentials: true,
   })
 );
