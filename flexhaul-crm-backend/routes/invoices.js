@@ -1,6 +1,8 @@
 // routes/invoices.js
 const express = require("express");
+const crypto = require("crypto");
 const { db, logActivity } = require("../db");
+const { buildInvoicePdf } = require("../services/invoicePdf");
 
 const router = express.Router();
 const VALID_STATUSES = ["unpaid", "paid", "overdue"];
@@ -34,22 +36,52 @@ router.post("/", (req, res) => {
   if (!job) return res.status(400).json({ error: "job_id does not match an existing job" });
 
   let finalAmount = amount;
+  let lineItems = "[]";
   if (finalAmount === undefined && estimate_id) {
     const estimate = db.prepare("SELECT * FROM estimates WHERE id = ?").get(estimate_id);
     if (!estimate) return res.status(400).json({ error: "estimate_id does not match an existing estimate" });
     finalAmount = estimate.total;
+    lineItems = estimate.line_items;
   }
   if (finalAmount === undefined) {
     return res.status(400).json({ error: "Provide either amount or estimate_id" });
   }
 
   const result = db
-    .prepare("INSERT INTO invoices (job_id, amount, due_date) VALUES (?, ?, ?)")
-    .run(job_id, finalAmount, due_date || null);
+    .prepare("INSERT INTO invoices (job_id, amount, line_items, due_date, share_token) VALUES (?, ?, ?, ?, ?)")
+    .run(job_id, finalAmount, lineItems, due_date || null, crypto.randomBytes(16).toString("hex"));
 
   const id = Number(result.lastInsertRowid);
   logActivity("job", job_id, `Invoice #${id} generated \u2014 $${Number(finalAmount).toFixed(2)}`, req.user && req.user.name);
   res.status(201).json({ invoice: db.prepare("SELECT * FROM invoices WHERE id = ?").get(id) });
+});
+
+// GET /api/invoices/:id/pdf — itemized invoice as a downloadable PDF.
+// Pulls the same customer/job join as the list view so the PDF has
+// everything it needs in one query.
+router.get("/:id/pdf", async (req, res) => {
+  const invoice = db
+    .prepare(
+      `SELECT invoices.*, jobs.address AS job_address,
+              customers.name AS customer_name, customers.phone AS customer_phone, customers.email AS customer_email
+       FROM invoices
+       JOIN jobs ON jobs.id = invoices.job_id
+       JOIN deals ON deals.id = jobs.deal_id
+       JOIN customers ON customers.id = deals.customer_id
+       WHERE invoices.id = ?`
+    )
+    .get(req.params.id);
+  if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+
+  try {
+    const pdfBuffer = await buildInvoicePdf(invoice);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="FlexHaul-Invoice-${invoice.id}.pdf"`);
+    res.send(pdfBuffer);
+  } catch (err) {
+    console.error("PDF generation failed:", err.message);
+    res.status(500).json({ error: "Could not generate PDF" });
+  }
 });
 
 // PATCH /api/invoices/:id — mark paid/unpaid/overdue
@@ -80,6 +112,18 @@ router.patch("/:id", (req, res) => {
 
   if (req.body.status && req.body.status !== existing.status) {
     logActivity("job", existing.job_id, `Invoice #${req.params.id} marked ${req.body.status}`, req.user && req.user.name);
+
+    // Closes the loop: a paid invoice means the deal is genuinely done,
+    // so it moves to its final stage automatically instead of sitting in
+    // "Won" forever and getting double-counted as still-open pipeline
+    // value in reporting even though the money's already in.
+    if (req.body.status === "paid") {
+      const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(existing.job_id);
+      if (job) {
+        db.prepare("UPDATE deals SET stage = 'invoiced', updated_at = datetime('now') WHERE id = ? AND stage != 'invoiced'").run(job.deal_id);
+        db.prepare("UPDATE jobs SET status = 'complete', updated_at = datetime('now') WHERE id = ? AND status != 'complete'").run(job.id);
+      }
+    }
   }
 
   res.json({ invoice: db.prepare("SELECT * FROM invoices WHERE id = ?").get(req.params.id) });

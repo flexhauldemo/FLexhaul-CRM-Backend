@@ -1,6 +1,9 @@
+const crypto = require("crypto");
+
 // routes/estimates.js
 const express = require("express");
 const { db, logActivity } = require("../db");
+const { acceptEstimate, AcceptanceError } = require("../services/estimateAcceptance");
 
 const router = express.Router();
 
@@ -34,10 +37,11 @@ router.post("/", (req, res) => {
 
   const items = Array.isArray(line_items) ? line_items : [];
   const total = computeTotal(items);
+  const shareToken = crypto.randomBytes(16).toString("hex");
 
   const result = db
-    .prepare("INSERT INTO estimates (deal_id, line_items, total) VALUES (?, ?, ?)")
-    .run(deal_id, JSON.stringify(items), total);
+    .prepare("INSERT INTO estimates (deal_id, line_items, total, share_token) VALUES (?, ?, ?, ?)")
+    .run(deal_id, JSON.stringify(items), total, shareToken);
 
   const id = Number(result.lastInsertRowid);
 
@@ -81,55 +85,16 @@ router.patch("/:id", (req, res) => {
 // manual ones, since "accepted" is the actual decision point where all
 // of that becomes true at once.
 router.post("/:id/accept", (req, res) => {
-  const estimate = db.prepare("SELECT * FROM estimates WHERE id = ?").get(req.params.id);
-  if (!estimate) return res.status(404).json({ error: "Estimate not found" });
-  if (estimate.accepted) {
-    return res.status(400).json({ error: "This estimate has already been accepted." });
+  try {
+    const result = acceptEstimate(req.params.id, (req.user && req.user.name) || "Staff");
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    if (err instanceof AcceptanceError) {
+      return res.status(err.status).json({ error: err.message });
+    }
+    console.error("Accept estimate failed:", err.message);
+    res.status(500).json({ error: "Something went wrong accepting this estimate." });
   }
-
-  const deal = db
-    .prepare(
-      `SELECT deals.*, customers.address AS customer_address
-       FROM deals JOIN customers ON customers.id = deals.customer_id
-       WHERE deals.id = ?`
-    )
-    .get(estimate.deal_id);
-  if (!deal) return res.status(400).json({ error: "This estimate's deal no longer exists." });
-
-  db.prepare("UPDATE estimates SET accepted = 1, updated_at = datetime('now') WHERE id = ?").run(estimate.id);
-
-  const EARLY_STAGES = ["new_lead", "quoted"];
-  if (EARLY_STAGES.includes(deal.stage)) {
-    db.prepare("UPDATE deals SET stage = 'won', updated_at = datetime('now') WHERE id = ?").run(deal.id);
-  }
-
-  const jobResult = db
-    .prepare(
-      "INSERT INTO jobs (deal_id, status, address, notes) VALUES (?, 'scheduled', ?, ?)"
-    )
-    .run(deal.id, deal.customer_address || null, "Created automatically when the estimate was accepted — pick a date when ready.");
-  const jobId = Number(jobResult.lastInsertRowid);
-
-  const dueDate = new Date();
-  dueDate.setDate(dueDate.getDate() + 30);
-  const invoiceResult = db
-    .prepare("INSERT INTO invoices (job_id, amount, due_date) VALUES (?, ?, ?)")
-    .run(jobId, estimate.total, dueDate.toISOString().slice(0, 10));
-  const invoiceId = Number(invoiceResult.lastInsertRowid);
-
-  logActivity(
-    "deal",
-    deal.id,
-    `Estimate accepted ($${estimate.total.toFixed(2)}) — job #${jobId} and invoice #${invoiceId} created automatically`,
-    req.user && req.user.name
-  );
-
-  res.json({
-    ok: true,
-    estimate: db.prepare("SELECT * FROM estimates WHERE id = ?").get(estimate.id),
-    job: db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId),
-    invoice: db.prepare("SELECT * FROM invoices WHERE id = ?").get(invoiceId),
-  });
 });
 
 module.exports = router;

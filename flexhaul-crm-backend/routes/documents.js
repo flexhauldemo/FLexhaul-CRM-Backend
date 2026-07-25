@@ -44,12 +44,12 @@ const upload = multer({
   },
 });
 
-// POST /api/documents — multipart form: fields job_id, type, plus file field "file"
+// POST /api/documents — multipart form: fields job_id, type, expires_at (optional), plus file field "file"
 router.post("/", (req, res) => {
   upload.single("file")(req, res, (err) => {
     if (err) return res.status(400).json({ error: err.message });
 
-    const { job_id, type } = req.body || {};
+    const { job_id, type, expires_at } = req.body || {};
     if (!job_id) return res.status(400).json({ error: "job_id is required" });
     if (!req.file) return res.status(400).json({ error: "No file uploaded (field name must be 'file')" });
 
@@ -63,13 +63,47 @@ router.post("/", (req, res) => {
     const fileUrl = `/uploads/${req.file.filename}`;
 
     const result = db
-      .prepare("INSERT INTO documents (job_id, type, file_url, original_name) VALUES (?, ?, ?, ?)")
-      .run(job_id, finalType, fileUrl, req.file.originalname);
+      .prepare("INSERT INTO documents (job_id, type, file_url, original_name, expires_at) VALUES (?, ?, ?, ?, ?)")
+      .run(job_id, finalType, fileUrl, req.file.originalname, expires_at || null);
 
     const id = Number(result.lastInsertRowid);
     logActivity("job", job_id, `Document uploaded (${finalType}): ${req.file.originalname}`, req.user && req.user.name);
     res.status(201).json({ document: db.prepare("SELECT * FROM documents WHERE id = ?").get(id) });
   });
+});
+
+// PATCH /api/documents/:id — mainly for setting/correcting an expiration
+// date after the fact, without re-uploading the whole file.
+router.patch("/:id", (req, res) => {
+  const doc = db.prepare("SELECT * FROM documents WHERE id = ?").get(req.params.id);
+  if (!doc) return res.status(404).json({ error: "Document not found" });
+  if (req.body.expires_at === undefined && req.body.type === undefined) {
+    return res.status(400).json({ error: "Nothing to update" });
+  }
+  const type = req.body.type !== undefined && ALLOWED_TYPES.includes(req.body.type) ? req.body.type : doc.type;
+  const expiresAt = req.body.expires_at !== undefined ? req.body.expires_at : doc.expires_at;
+  db.prepare("UPDATE documents SET type = ?, expires_at = ? WHERE id = ?").run(type, expiresAt, req.params.id);
+  res.json({ document: db.prepare("SELECT * FROM documents WHERE id = ?").get(req.params.id) });
+});
+
+// GET /api/documents/expiring — permits/COIs/surveys expiring within 30
+// days (or already expired), joined with job + customer context. This
+// is what powers the compliance alert on the Dashboard.
+router.get("/expiring", (req, res) => {
+  const days = Number(req.query.days) || 30;
+  const rows = db
+    .prepare(
+      `SELECT documents.*, jobs.address AS job_address, customers.name AS customer_name
+       FROM documents
+       JOIN jobs ON jobs.id = documents.job_id
+       JOIN deals ON deals.id = jobs.deal_id
+       JOIN customers ON customers.id = deals.customer_id
+       WHERE documents.expires_at IS NOT NULL
+         AND documents.expires_at <= date('now', '+' || ? || ' days')
+       ORDER BY documents.expires_at ASC`
+    )
+    .all(days);
+  res.json({ documents: rows });
 });
 
 // GET /api/documents/job/:jobId

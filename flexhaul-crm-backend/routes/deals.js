@@ -74,7 +74,7 @@ router.get("/:id", (req, res) => {
 
 // POST /api/deals
 router.post("/", (req, res) => {
-  const { customer_id, stage, source, estimated_value } = req.body || {};
+  const { customer_id, stage, source, estimated_value, service_type } = req.body || {};
   if (!customer_id) return res.status(400).json({ error: "customer_id is required" });
 
   const customer = db.prepare("SELECT id FROM customers WHERE id = ?").get(customer_id);
@@ -83,9 +83,9 @@ router.post("/", (req, res) => {
   const finalStage = VALID_STAGES.includes(stage) ? stage : "new_lead";
   const result = db
     .prepare(
-      "INSERT INTO deals (customer_id, stage, source, estimated_value) VALUES (?, ?, ?, ?)"
+      "INSERT INTO deals (customer_id, stage, source, estimated_value, service_type) VALUES (?, ?, ?, ?, ?)"
     )
-    .run(customer_id, finalStage, source || "other", estimated_value || 0);
+    .run(customer_id, finalStage, source || "other", estimated_value || 0, service_type || null);
 
   const id = Number(result.lastInsertRowid);
   logActivity("deal", id, `Deal created (stage: ${finalStage})`, req.user && req.user.name);
@@ -101,7 +101,7 @@ router.patch("/:id", (req, res) => {
     return res.status(400).json({ error: `stage must be one of: ${VALID_STAGES.join(", ")}` });
   }
 
-  const fields = ["stage", "source", "estimated_value", "notes"];
+  const fields = ["stage", "source", "estimated_value", "notes", "service_type"];
   const updates = [];
   const values = [];
   fields.forEach((f) => {
@@ -116,6 +116,8 @@ router.patch("/:id", (req, res) => {
   values.push(req.params.id);
   db.prepare(`UPDATE deals SET ${updates.join(", ")} WHERE id = ?`).run(...values);
 
+  let autoCreated = null;
+
   if (req.body.stage && req.body.stage !== existing.stage) {
     logActivity(
       "deal",
@@ -123,9 +125,53 @@ router.patch("/:id", (req, res) => {
       `Stage changed: ${existing.stage} \u2192 ${req.body.stage}`,
       req.user && req.user.name
     );
+
+    // The automation the business actually asked for: once a quote is
+    // agreed to (the deal moves into "won"), a Job and an Invoice build
+    // themselves — no separate manual steps. The job comes out
+    // unscheduled (no date yet, since that's a real-world scheduling
+    // decision a person still has to make) but it already exists and is
+    // ready to be dated from the Jobs screen or Calendar. Guarded so this
+    // only ever fires once per deal, even if the stage gets set to "won"
+    // again later (e.g. after being moved back and forward).
+    if (req.body.stage === "won") {
+      const alreadyHasJob = db.prepare("SELECT id FROM jobs WHERE deal_id = ?").get(req.params.id);
+      const latestEstimate = db
+        .prepare("SELECT * FROM estimates WHERE deal_id = ? ORDER BY created_at DESC LIMIT 1")
+        .get(req.params.id);
+
+      if (!alreadyHasJob && latestEstimate) {
+        const dealWithCustomer = db
+          .prepare(
+            `SELECT deals.*, customers.address AS customer_address
+             FROM deals JOIN customers ON customers.id = deals.customer_id
+             WHERE deals.id = ?`
+          )
+          .get(req.params.id);
+
+        const jobResult = db
+          .prepare("INSERT INTO jobs (deal_id, status, address) VALUES (?, 'scheduled', ?)")
+          .run(req.params.id, dealWithCustomer.customer_address || null);
+        const jobId = Number(jobResult.lastInsertRowid);
+        logActivity("job", jobId, "Job auto-created — deal marked won with an agreed estimate", req.user && req.user.name);
+
+        const invoiceResult = db
+          .prepare("INSERT INTO invoices (job_id, amount, status) VALUES (?, ?, 'unpaid')")
+          .run(jobId, latestEstimate.total);
+        const invoiceId = Number(invoiceResult.lastInsertRowid);
+        logActivity(
+          "job",
+          jobId,
+          `Invoice #${invoiceId} auto-created \u2014 $${Number(latestEstimate.total).toFixed(2)}`,
+          req.user && req.user.name
+        );
+
+        autoCreated = { job_id: jobId, invoice_id: invoiceId };
+      }
+    }
   }
 
-  res.json({ deal: db.prepare("SELECT * FROM deals WHERE id = ?").get(req.params.id) });
+  res.json({ deal: db.prepare("SELECT * FROM deals WHERE id = ?").get(req.params.id), auto_created: autoCreated });
 });
 
 module.exports = router;

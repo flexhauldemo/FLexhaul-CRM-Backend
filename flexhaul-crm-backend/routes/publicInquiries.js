@@ -25,6 +25,17 @@ function clip(str, max) {
   return String(str).slice(0, max);
 }
 
+// The website sends a human-readable string like "Junk Removal" or
+// "Furniture Pickup" — map it to the structured type reporting groups by.
+// Anything unrecognized falls into 'other' rather than breaking.
+function mapServiceType(service) {
+  const s = String(service || "").toLowerCase();
+  if (s.includes("furniture")) return "furniture_pickup";
+  if (s.includes("demo")) return "light_demolition";
+  if (s.includes("junk") || s.includes("haul")) return "junk_removal";
+  return "other";
+}
+
 router.post("/", (req, res) => {
   const { name, phone, email, address, description, service, source } = req.body || {};
 
@@ -62,9 +73,9 @@ router.post("/", (req, res) => {
   const dealDescription = [service, cleanDescription].filter(Boolean).join(" \u2014 ") || null;
   const dealResult = db
     .prepare(
-      "INSERT INTO deals (customer_id, stage, source, estimated_value, notes) VALUES (?, 'new_lead', ?, 0, ?)"
+      "INSERT INTO deals (customer_id, stage, source, estimated_value, notes, service_type) VALUES (?, 'new_lead', ?, 0, ?, ?)"
     )
-    .run(customer.id, cleanSource, dealDescription);
+    .run(customer.id, cleanSource, dealDescription, mapServiceType(service));
   const dealId = Number(dealResult.lastInsertRowid);
 
   logActivity("deal", dealId, "New inquiry submitted through the website");
