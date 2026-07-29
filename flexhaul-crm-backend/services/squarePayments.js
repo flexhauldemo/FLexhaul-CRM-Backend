@@ -36,7 +36,9 @@ function getClient() {
     squareClient = new SquareClient({
       token,
       environment:
-        process.env.SQUARE_ENVIRONMENT === "sandbox" ? SquareEnvironment.Sandbox : SquareEnvironment.Production,
+        (process.env.SQUARE_ENVIRONMENT || "").trim().toLowerCase() === "sandbox"
+          ? SquareEnvironment.Sandbox
+          : SquareEnvironment.Production,
     });
     return squareClient;
   } catch (err) {
