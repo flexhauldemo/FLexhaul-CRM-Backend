@@ -5,9 +5,21 @@
 // searchable, categorized picker instead of a flat list of 100+ items.
 
 const express = require("express");
-const { db } = require("../db");
+const { db, reseedPriceCatalog } = require("../db");
+const { requireAdmin } = require("../middleware/auth");
 
 const router = express.Router();
+
+// POST /api/price-catalog/reload — admin-only. Wipes the whole catalog
+// and reloads it fresh from the official list baked into db.js. Use
+// this after the pricing itself has been updated (a new price guide,
+// a rate change) and redeployed — the catalog only auto-seeds once on
+// a brand-new database, so this is how you actually get new pricing
+// onto a database that already has the old catalog in it.
+router.post("/reload", requireAdmin, (req, res) => {
+  const count = reseedPriceCatalog();
+  res.json({ ok: true, itemsLoaded: count });
+});
 
 router.get("/", (req, res) => {
   const rows = db.prepare("SELECT * FROM price_catalog ORDER BY category, label").all();
