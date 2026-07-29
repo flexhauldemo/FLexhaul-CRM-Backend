@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS invoices (
   share_token TEXT, -- lets a customer view/pay this exact invoice with no login
   stripe_payment_link TEXT, -- cached Stripe Checkout URL, only ever set if STRIPE_SECRET_KEY is configured
   stripe_session_id TEXT,
+  square_payment_link TEXT, -- cached Square Checkout URL, only ever set if SQUARE_ACCESS_TOKEN is configured
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   paid_at TEXT
 );
@@ -184,6 +185,9 @@ if (!invoicesColumns.includes("stripe_payment_link")) {
 if (!invoicesColumns.includes("stripe_session_id")) {
   db.exec("ALTER TABLE invoices ADD COLUMN stripe_session_id TEXT;");
 }
+if (!invoicesColumns.includes("square_payment_link")) {
+  db.exec("ALTER TABLE invoices ADD COLUMN square_payment_link TEXT;");
+}
 if (!invoicesColumns.includes("share_token")) {
   db.exec("ALTER TABLE invoices ADD COLUMN share_token TEXT;");
 }
@@ -231,141 +235,168 @@ db.exec(`
   WHERE share_token IS NULL;
 `);
 
-// Auto-seed the price catalog on first boot — this is what lets the
-// estimate builder offer "pick from a list" instead of typing every line
-// item by hand. Only runs once (checks if the table is already populated),
-// so it's safe on every restart. To adjust pricing later, edit rows
-// directly via the Price Catalog admin screen rather than here.
-const catalogCount = db.prepare("SELECT COUNT(*) AS n FROM price_catalog").get().n;
-if (catalogCount === 0) {
+// The full price catalog data, as a function so both the first-boot
+// auto-seed below AND the admin-triggered "Reload Full Catalog" action
+// (routes/priceCatalog.js) use the exact same list — one source of
+// truth, never two copies quietly drifting apart. Wipes and replaces
+// every row when called, since the intent when you run this is always
+// "load the current official pricing," not "merge with whatever's
+// already there."
+function reseedPriceCatalog() {
+  db.exec("DELETE FROM price_catalog;");
   const insertCatalogItem = db.prepare(
     "INSERT INTO price_catalog (category, label, type, unit, rate) VALUES (?, ?, ?, ?, ?)"
   );
   const catalog = [
-    // Living & Dining Room
-    ["Living & Dining Room", "Recliner", "other", "item", 75],
-    ["Living & Dining Room", "Oversized Recliner", "other", "item", 90],
-    ["Living & Dining Room", "Loveseat", "other", "item", 95],
-    ["Living & Dining Room", "Standard Couch", "other", "item", 125],
-    ["Living & Dining Room", "Sectional (2-piece)", "other", "item", 225],
-    ["Living & Dining Room", "Large Sectional", "other", "item", 300],
-    ["Living & Dining Room", "Sleeper Sofa", "other", "item", 175],
-    ["Living & Dining Room", "Coffee Table", "other", "item", 35],
-    ["Living & Dining Room", "End Table", "other", "item", 20],
-    ["Living & Dining Room", "Entertainment Center", "other", "item", 150],
-    ["Living & Dining Room", "TV Stand", "other", "item", 60],
-    ["Living & Dining Room", "Dining Chair", "other", "item", 15],
-    ["Living & Dining Room", "Dining Table", "other", "item", 60],
-    ["Living & Dining Room", "Dining Set", "other", "item", 150],
-    ["Living & Dining Room", "China Cabinet", "other", "item", 175],
-    ["Living & Dining Room", "Buffet", "other", "item", 90],
+    // Junk Removal
+    ["Junk Removal", "Dining Chair", "other", "item", 20],
+    ["Junk Removal", "Office Chair", "other", "item", 25],
+    ["Junk Removal", "Recliner", "other", "item", 75],
+    ["Junk Removal", "Loveseat", "other", "item", 95],
+    ["Junk Removal", "Standard Couch", "other", "item", 125],
+    ["Junk Removal", "Sectional (per section)", "other", "item", 75],
+    ["Junk Removal", "Sleeper Sofa", "other", "item", 175],
+    ["Junk Removal", "Ottoman", "other", "item", 20],
+    ["Junk Removal", "Coffee Table", "other", "item", 30],
+    ["Junk Removal", "End Table", "other", "item", 20],
+    ["Junk Removal", "TV Stand", "other", "item", 50],
+    ["Junk Removal", "Entertainment Center", "other", "item", 150],
+    ["Junk Removal", "Bookshelf (Small)", "other", "item", 40],
+    ["Junk Removal", "Bookshelf (Large)", "other", "item", 85],
+    ["Junk Removal", "Desk (Small)", "other", "item", 60],
+    ["Junk Removal", "Executive Desk", "other", "item", 150],
+    ["Junk Removal", "Filing Cabinet (Empty)", "other", "item", 50],
+    ["Junk Removal", "Filing Cabinet (Full)", "other", "item", 95],
 
-    // Bedroom & Mattresses
-    ["Bedroom & Mattresses", "Night Stand", "other", "item", 30],
-    ["Bedroom & Mattresses", "Small Dresser", "other", "item", 60],
-    ["Bedroom & Mattresses", "Large Dresser", "other", "item", 95],
-    ["Bedroom & Mattresses", "Chest of Drawers", "other", "item", 75],
-    ["Bedroom & Mattresses", "Armoire", "other", "item", 125],
-    ["Bedroom & Mattresses", "Bed Frame", "other", "item", 50],
-    ["Bedroom & Mattresses", "Headboard", "other", "item", 35],
-    ["Bedroom & Mattresses", "Footboard", "other", "item", 25],
-    ["Bedroom & Mattresses", "Vanity", "other", "item", 90],
-    ["Bedroom & Mattresses", "Adjustable Bed Base", "other", "item", 175],
-    ["Bedroom & Mattresses", "Twin Mattress", "other", "item", 70],
-    ["Bedroom & Mattresses", "Twin Box Spring", "other", "item", 40],
-    ["Bedroom & Mattresses", "Full Mattress", "other", "item", 80],
-    ["Bedroom & Mattresses", "Full Box Spring", "other", "item", 45],
-    ["Bedroom & Mattresses", "Queen Mattress", "other", "item", 90],
-    ["Bedroom & Mattresses", "Queen Box Spring", "other", "item", 50],
-    ["Bedroom & Mattresses", "King Mattress", "other", "item", 110],
-    ["Bedroom & Mattresses", "King Box Spring", "other", "item", 60],
+    // Mattresses
+    ["Mattresses", "Twin Mattress", "other", "item", 60],
+    ["Mattresses", "Twin Box Spring", "other", "item", 35],
+    ["Mattresses", "Full Mattress", "other", "item", 70],
+    ["Mattresses", "Full Box Spring", "other", "item", 40],
+    ["Mattresses", "Queen Mattress", "other", "item", 80],
+    ["Mattresses", "Queen Box Spring", "other", "item", 45],
+    ["Mattresses", "King Mattress", "other", "item", 95],
+    ["Mattresses", "King Box Spring", "other", "item", 50],
+    ["Mattresses", "Adjustable Bed Base", "other", "item", 125],
+
+    // Bedroom Furniture
+    ["Bedroom Furniture", "Night Stand", "other", "item", 25],
+    ["Bedroom Furniture", "Small Dresser", "other", "item", 75],
+    ["Bedroom Furniture", "Large Dresser", "other", "item", 125],
+    ["Bedroom Furniture", "Armoire", "other", "item", 175],
+    ["Bedroom Furniture", "Headboard", "other", "item", 35],
+    ["Bedroom Furniture", "Bed Frame", "other", "item", 40],
+    ["Bedroom Furniture", "Complete Bedroom Set", "other", "item", 325],
 
     // Appliances
-    ["Appliances", "Microwave", "other", "item", 30],
-    ["Appliances", "Mini Fridge", "other", "item", 55],
-    ["Appliances", "Refrigerator", "other", "item", 110],
-    ["Appliances", "Deep Freezer", "other", "item", 110],
-    ["Appliances", "Washer", "other", "item", 90],
-    ["Appliances", "Dryer", "other", "item", 90],
+    ["Appliances", "Refrigerator", "other", "item", 125],
+    ["Appliances", "Freezer", "other", "item", 100],
+    ["Appliances", "Stove", "other", "item", 95],
     ["Appliances", "Dishwasher", "other", "item", 75],
-    ["Appliances", "Stove", "other", "item", 100],
-    ["Appliances", "Water Heater", "other", "item", 85],
-
-    // Office Furniture
-    ["Office Furniture", "Office Chair", "other", "item", 25],
-    ["Office Furniture", "Desk", "other", "item", 75],
-    ["Office Furniture", "Large Executive Desk", "other", "item", 150],
-    ["Office Furniture", "Filing Cabinet", "other", "item", 45],
-    ["Office Furniture", "Cubicle Section", "other", "item", 125],
-
-    // Electronics
-    ["Electronics", "Flat Screen TV (under 40\")", "other", "item", 40],
-    ["Electronics", "TV (40-65\")", "other", "item", 60],
-    ["Electronics", "TV (65\"+)", "other", "item", 80],
-    ["Electronics", "CRT TV", "other", "item", 125],
-    ["Electronics", "Computer", "other", "item", 30],
-    ["Electronics", "Printer", "other", "item", 35],
+    ["Appliances", "Washer", "other", "item", 95],
+    ["Appliances", "Dryer", "other", "item", 95],
+    ["Appliances", "Water Heater", "other", "item", 90],
+    ["Appliances", "Microwave", "other", "item", 25],
 
     // Exercise Equipment
-    ["Exercise Equipment", "Treadmill", "other", "item", 125],
-    ["Exercise Equipment", "Elliptical", "other", "item", 100],
-    ["Exercise Equipment", "Weight Bench", "other", "item", 60],
-    ["Exercise Equipment", "Home Gym", "other", "item", 300],
     ["Exercise Equipment", "Exercise Bike", "other", "item", 75],
+    ["Exercise Equipment", "Treadmill", "other", "item", 150],
+    ["Exercise Equipment", "Elliptical", "other", "item", 150],
+    ["Exercise Equipment", "Weight Bench", "other", "item", 85],
+    ["Exercise Equipment", "Home Gym", "other", "item", 275],
 
-    // Outdoor & Garage
-    ["Outdoor & Garage", "Grill", "other", "item", 60],
-    ["Outdoor & Garage", "Push Mower", "other", "item", 55],
-    ["Outdoor & Garage", "Riding Mower", "other", "item", 125],
-    ["Outdoor & Garage", "Wheelbarrow", "other", "item", 25],
-    ["Outdoor & Garage", "Patio Chair", "other", "item", 20],
-    ["Outdoor & Garage", "Patio Table", "other", "item", 45],
-    ["Outdoor & Garage", "Patio Set", "other", "item", 125],
-    ["Outdoor & Garage", "Fire Pit", "other", "item", 50],
-    ["Outdoor & Garage", "Tire", "other", "item", 15],
-    ["Outdoor & Garage", "Tire w/ Rim", "other", "item", 20],
-    ["Outdoor & Garage", "Lawn Tools", "other", "item", 10],
-    ["Outdoor & Garage", "Shelving Unit", "other", "item", 60],
-    ["Outdoor & Garage", "Tool Chest", "other", "item", 125],
-    ["Outdoor & Garage", "Work Bench", "other", "item", 95],
+    // Electronics
+    ["Electronics", "TV (under 40\")", "other", "item", 20],
+    ["Electronics", "TV (over 40\")", "other", "item", 40],
+    ["Electronics", "Computer", "other", "item", 20],
+    ["Electronics", "Printer", "other", "item", 20],
 
-    // Hot Tubs & Playsets
-    ["Hot Tubs & Playsets", "Hot Tub (already disconnected)", "other", "item", 550],
-    ["Hot Tubs & Playsets", "Small Wood Playset", "other", "item", 350],
-    ["Hot Tubs & Playsets", "Medium Playset", "other", "item", 500],
-    ["Hot Tubs & Playsets", "Large Playset", "other", "item", 800],
+    // Outdoor
+    ["Outdoor", "Grill", "other", "item", 75],
+    ["Outdoor", "Push Mower", "other", "item", 60],
+    ["Outdoor", "Riding Mower", "other", "item", 175],
+    ["Outdoor", "Snowblower", "other", "item", 95],
+    ["Outdoor", "Wheelbarrow", "other", "item", 35],
+    ["Outdoor", "Patio Chair", "other", "item", 20],
+    ["Outdoor", "Patio Table", "other", "item", 50],
+
+    // Tires
+    ["Tires", "Passenger Tire", "other", "item", 20],
+    ["Tires", "Tire with Rim", "other", "item", 30],
+    ["Tires", "Tractor Tire (Manual Quote)", "other", "item", 0],
+
+    // Construction Debris
+    ["Construction Debris", "Drywall Bag", "disposal", "item", 20],
+    ["Construction Debris", "Lumber (Pickup Load)", "disposal", "load", 150],
+    ["Construction Debris", "Mixed Construction Debris (Pickup Load)", "disposal", "load", 225],
+    ["Construction Debris", "Concrete (Manual Quote, per Cubic Yard)", "disposal", "cubic_yard", 0],
+    ["Construction Debris", "Brick (Pickup Load)", "disposal", "load", 250],
+    ["Construction Debris", "Dirt (Pickup Load)", "disposal", "load", 200],
+
+    // Hauling Volume (trailer load, by fraction)
+    ["Hauling Volume", "1/8 Trailer Load", "disposal", "load", 125],
+    ["Hauling Volume", "1/4 Trailer Load", "disposal", "load", 225],
+    ["Hauling Volume", "3/8 Trailer Load", "disposal", "load", 300],
+    ["Hauling Volume", "1/2 Trailer Load", "disposal", "load", 400],
+    ["Hauling Volume", "5/8 Trailer Load", "disposal", "load", 475],
+    ["Hauling Volume", "3/4 Trailer Load", "disposal", "load", 550],
+    ["Hauling Volume", "7/8 Trailer Load", "disposal", "load", 625],
+    ["Hauling Volume", "Full Trailer Load", "disposal", "load", 700],
 
     // Demolition
-    ["Demolition", "Shed Demo — Plastic Storage", "other", "job", 375],
-    ["Demolition", "Shed Demo — 8x8", "other", "job", 600],
-    ["Demolition", "Shed Demo — 10x10", "other", "job", 800],
-    ["Demolition", "Shed Demo — 10x12", "other", "job", 975],
-    ["Demolition", "Shed Demo — 12x16", "other", "job", 1450],
-    ["Demolition", "Shed Demo — Concrete Floor Add-On", "other", "job", 650],
-    ["Demolition", "Deck Demo — Small (under 150 sq ft)", "other", "job", 700],
-    ["Demolition", "Deck Demo — Medium (150-300 sq ft)", "other", "job", 1250],
-    ["Demolition", "Deck Demo — Large (300-500 sq ft)", "other", "job", 2200],
-    ["Demolition", "Deck Demo — Elevated Add-On", "other", "job", 550],
-    ["Demolition", "Fence Removal — Wood", "other", "linear_ft", 10],
-    ["Demolition", "Fence Removal — Chain Link", "other", "linear_ft", 8.5],
-    ["Demolition", "Fence Removal — Vinyl", "other", "linear_ft", 11.5],
+    ["Demolition", "Deck Removal 8x8", "other", "item", 500],
+    ["Demolition", "Deck Removal 10x10", "other", "item", 700],
+    ["Demolition", "Deck Removal 12x12", "other", "item", 900],
+    ["Demolition", "Deck Removal 16x16", "other", "item", 1400],
+    ["Demolition", "Shed Removal \u2014 Plastic 8x8", "other", "item", 500],
+    ["Demolition", "Shed Removal \u2014 Wood 8x8", "other", "item", 700],
+    ["Demolition", "Shed Removal \u2014 Wood 10x12", "other", "item", 900],
+    ["Demolition", "Shed Removal \u2014 Wood 12x16", "other", "item", 1300],
+    ["Demolition", "Fence Removal \u2014 Chain Link (per linear ft)", "other", "linear_ft", 12],
+    ["Demolition", "Fence Removal \u2014 Wood (per linear ft)", "other", "linear_ft", 15],
+    ["Demolition", "Fence Removal \u2014 Vinyl (per linear ft)", "other", "linear_ft", 18],
+    ["Demolition", "Hot Tub Removal ($450\u2013$700, avg shown)", "other", "item", 575],
+    ["Demolition", "Swing Set Removal ($300\u2013$500, avg shown)", "other", "item", 400],
+    ["Demolition", "Above Ground Pool Removal ($500\u2013$700, avg shown)", "other", "item", 600],
+    ["Demolition", "Bathroom Demo ($800\u2013$1,500, avg shown)", "other", "item", 1150],
+    ["Demolition", "Kitchen Demo ($1,500\u2013$3,500, avg shown)", "other", "item", 2500],
+    ["Demolition", "Flooring Removal (per sq ft, $2.50\u2013$5 avg shown)", "other", "sqft", 3.75],
+    ["Demolition", "Drywall Removal (per sq ft, $2\u2013$3.50 avg shown)", "other", "sqft", 2.75],
+    ["Demolition", "Ceiling Removal (per sq ft, $3\u2013$5 avg shown)", "other", "sqft", 4],
+    ["Demolition", "Cabinet Removal (each)", "other", "item", 100],
+    ["Demolition", "Countertop Removal (per linear ft, $15\u2013$30 avg shown)", "other", "linear_ft", 22.5],
 
-    // Hauling & Debris
-    ["Hauling & Debris", "Construction Debris — Pickup Load", "disposal", "load", 150],
-    ["Hauling & Debris", "Construction Debris — 1/4 Trailer", "disposal", "load", 200],
-    ["Hauling & Debris", "Construction Debris — 1/2 Trailer", "disposal", "load", 350],
-    ["Hauling & Debris", "Construction Debris — 3/4 Trailer", "disposal", "load", 500],
-    ["Hauling & Debris", "Construction Debris — Full Trailer", "disposal", "load", 650],
-    ["Hauling & Debris", "Yard Waste — Brush Pile", "disposal", "load", 110],
-    ["Hauling & Debris", "Yard Waste — Leaves", "disposal", "load", 75],
-    ["Hauling & Debris", "Yard Waste — Tree Branches", "disposal", "load", 200],
-    ["Hauling & Debris", "Railroad Tie", "disposal", "item", 30],
-
-    // Labor
-    ["Labor", "Crew Labor (per hour)", "labor", "hr", 65],
-    ["Labor", "Minimum Service Call", "labor", "job", 95],
+    // Travel & Adjustments — add these on top of the base job as needed.
+    // Same-Day (+15%) and After-Hours (+25%) are percentage surcharges,
+    // not flat fees, so they aren't in this list — apply them by hand
+    // as a percentage of the subtotal when relevant.
+    ["Travel & Adjustments", "Travel 21\u201330 Miles", "labor", "trip", 25],
+    ["Travel & Adjustments", "Travel 31\u201340 Miles", "labor", "trip", 50],
+    ["Travel & Adjustments", "Travel 41\u201350 Miles", "labor", "trip", 75],
+    ["Travel & Adjustments", "Travel 51\u201360 Miles", "labor", "trip", 100],
+    ["Travel & Adjustments", "Travel Over 60 Miles (per mile)", "labor", "mile", 2],
+    ["Travel & Adjustments", "Upstairs (per flight)", "labor", "flight", 40],
+    ["Travel & Adjustments", "Basement Access", "labor", "job", 50],
+    ["Travel & Adjustments", "Long Carry", "labor", "job", 40],
+    ["Travel & Adjustments", "Heavy Item (under 500 lbs)", "labor", "item", 75],
+    ["Travel & Adjustments", "500+ lbs (Manual Review)", "labor", "item", 0],
+    ["Travel & Adjustments", "Disassembly ($50\u2013$150, avg shown)", "labor", "item", 100],
+    ["Travel & Adjustments", "Hazardous Materials (Manual Review)", "labor", "item", 0],
   ];
   catalog.forEach((row) => insertCatalogItem.run(...row));
+  return catalog.length;
+}
+
+// Auto-seed on first boot only (empty table) — this is what lets the
+// estimate builder offer "pick from a list" instead of typing every line
+// item by hand, without needing you to do anything on a brand-new
+// database. To reload pricing later (e.g. after this file's catalog
+// data changes), use the "Reload Full Catalog" action in the CRM
+// instead of relying on this — that one's safe to run anytime, this
+// boot check deliberately isn't (it would never touch a populated table).
+const catalogCount = db.prepare("SELECT COUNT(*) AS n FROM price_catalog").get().n;
+if (catalogCount === 0) {
+  reseedPriceCatalog();
 }
 
 function logActivity(entityType, entityId, note, createdBy) {
@@ -374,4 +405,4 @@ function logActivity(entityType, entityId, note, createdBy) {
   ).run(entityType, entityId, note, createdBy || "system");
 }
 
-module.exports = { db, logActivity };
+module.exports = { db, logActivity, reseedPriceCatalog };
