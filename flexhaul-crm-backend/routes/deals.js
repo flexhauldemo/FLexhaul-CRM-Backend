@@ -2,6 +2,7 @@
 const express = require("express");
 const { db, logActivity } = require("../db");
 const { requireAdmin } = require("../middleware/auth");
+const { createJobAndInvoice } = require("../services/estimateAcceptance");
 
 const router = express.Router();
 
@@ -134,6 +135,15 @@ router.patch("/:id", (req, res) => {
     // ready to be dated from the Jobs screen or Calendar. Guarded so this
     // only ever fires once per deal, even if the stage gets set to "won"
     // again later (e.g. after being moved back and forward).
+    //
+    // Uses the SAME createJobAndInvoice helper as the estimate Accept
+    // button (services/estimateAcceptance.js) — previously this had its
+    // own separate copy of the insert logic that left out share_token,
+    // due_date, and line_items on the invoice, so a deal marked Won by
+    // dragging it on the board (instead of clicking Accept on an
+    // estimate) produced an invoice with no working customer payment
+    // link. Sharing one function means both paths always produce the
+    // same, complete result.
     if (req.body.stage === "won") {
       const alreadyHasJob = db.prepare("SELECT id FROM jobs WHERE deal_id = ?").get(req.params.id);
       const latestEstimate = db
@@ -149,24 +159,12 @@ router.patch("/:id", (req, res) => {
           )
           .get(req.params.id);
 
-        const jobResult = db
-          .prepare("INSERT INTO jobs (deal_id, status, address) VALUES (?, 'scheduled', ?)")
-          .run(req.params.id, dealWithCustomer.customer_address || null);
-        const jobId = Number(jobResult.lastInsertRowid);
-        logActivity("job", jobId, "Job auto-created — deal marked won with an agreed estimate", req.user && req.user.name);
-
-        const invoiceResult = db
-          .prepare("INSERT INTO invoices (job_id, amount, status) VALUES (?, ?, 'unpaid')")
-          .run(jobId, latestEstimate.total);
-        const invoiceId = Number(invoiceResult.lastInsertRowid);
-        logActivity(
-          "job",
-          jobId,
-          `Invoice #${invoiceId} auto-created \u2014 $${Number(latestEstimate.total).toFixed(2)}`,
-          req.user && req.user.name
+        const { job, invoice } = createJobAndInvoice(
+          dealWithCustomer,
+          latestEstimate,
+          (req.user && req.user.name) || "Staff"
         );
-
-        autoCreated = { job_id: jobId, invoice_id: invoiceId };
+        autoCreated = { job_id: job.id, invoice_id: invoice.id };
       }
     }
   }
