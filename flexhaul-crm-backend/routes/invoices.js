@@ -120,7 +120,12 @@ router.patch("/:id", (req, res) => {
     if (req.body.status === "paid") {
       const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(existing.job_id);
       if (job) {
-        db.prepare("UPDATE deals SET stage = 'invoiced', updated_at = datetime('now') WHERE id = ? AND stage != 'invoiced'").run(job.deal_id);
+        // invoiced_at starts the 24-hour clock the Pipeline board uses to
+        // auto-archive this card (routes/deals.js GET /) — the full deal
+        // stays visible on the Customers tab indefinitely either way.
+        db.prepare(
+          "UPDATE deals SET stage = 'invoiced', invoiced_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND stage != 'invoiced'"
+        ).run(job.deal_id);
         db.prepare("UPDATE jobs SET status = 'complete', updated_at = datetime('now') WHERE id = ? AND status != 'complete'").run(job.id);
       }
     }
