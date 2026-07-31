@@ -21,6 +21,7 @@ const invoiceRoutes = require("./routes/invoices");
 const timeSlotsRoutes = require("./routes/timeSlots");
 const publicInquiriesRoutes = require("./routes/publicInquiries");
 const publicShareRoutes = require("./routes/publicShare");
+const publicAvailabilityRoutes = require("./routes/publicAvailability");
 const priceCatalogRoutes = require("./routes/priceCatalog");
 
 const app = express();
@@ -59,6 +60,7 @@ app.get("/api/health", (req, res) => res.json({ ok: true }));
 // before anyone has logged into anything.
 app.use("/api/auth", authRoutes);
 app.use("/api/public/inquiries", publicInquiriesRoutes);
+app.use("/api/public/availability", publicAvailabilityRoutes);
 app.use("/api/public", publicShareRoutes);
 
 app.use("/api/dashboard", requireAuth, dashboardRoutes);
