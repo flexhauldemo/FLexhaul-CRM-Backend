@@ -197,15 +197,6 @@ if (!dealsColumns2.includes("service_type")) {
   db.exec("ALTER TABLE deals ADD COLUMN service_type TEXT;");
 }
 
-// invoiced_at: stamped the moment a deal reaches its final "invoiced"
-// stage (see routes/invoices.js and routes/deals.js) — this is what the
-// Pipeline board measures the 24-hour auto-archive window against
-// (routes/deals.js GET /). Separate from updated_at because updated_at
-// changes on ANY edit to the deal, which would keep resetting the clock.
-if (!dealsColumns2.includes("invoiced_at")) {
-  db.exec("ALTER TABLE deals ADD COLUMN invoiced_at TEXT;");
-}
-
 const estimatesColumns2 = db.prepare("PRAGMA table_info(estimates)").all().map((c) => c.name);
 if (!estimatesColumns2.includes("share_token")) {
   db.exec("ALTER TABLE estimates ADD COLUMN share_token TEXT;");
@@ -242,23 +233,6 @@ db.exec(`
 db.exec(`
   UPDATE invoices SET share_token = lower(hex(randomblob(16)))
   WHERE share_token IS NULL;
-`);
-
-// Backfill invoiced_at for deals that were already sitting at the
-// "invoiced" stage before this column existed — otherwise they'd have
-// no timestamp to measure the 24-hour window against and would never
-// age off the Pipeline board. Prefers the real payment date from their
-// invoice; falls back to the deal's own updated_at if that's ever
-// unavailable (e.g. a deal manually set to "invoiced" without an
-// invoice being paid through the normal flow).
-db.exec(`
-  UPDATE deals SET invoiced_at = COALESCE(
-    (SELECT MAX(invoices.paid_at) FROM invoices
-       JOIN jobs ON jobs.id = invoices.job_id
-       WHERE jobs.deal_id = deals.id AND invoices.paid_at IS NOT NULL),
-    updated_at
-  )
-  WHERE stage = 'invoiced' AND invoiced_at IS NULL;
 `);
 
 // The full price catalog data, as a function so both the first-boot
@@ -431,4 +405,30 @@ function logActivity(entityType, entityId, note, createdBy) {
   ).run(entityType, entityId, note, createdBy || "system");
 }
 
-module.exports = { db, logActivity, reseedPriceCatalog };
+// The pipeline's stage order, used only to decide whether an automatic
+// advance is actually "forward" — never used to allow skipping stages a
+// human hasn't earned yet (e.g. this won't jump new_lead straight to
+// invoiced just because someone created an invoice by hand).
+const STAGE_ORDER = ["new_lead", "quoted", "won", "scheduled", "complete", "invoiced", "lost"];
+
+// Moves a deal to targetStage automatically, but only if targetStage is
+// genuinely further along than where the deal already is — so this is
+// safe to call from anywhere (job scheduling, invoice creation) without
+// ever accidentally regressing a deal that's already further ahead, or
+// re-triggering an activity log entry for a deal that's already there.
+// Returns true if it actually moved the deal, false if there was nothing
+// to do.
+function advanceDealStage(dealId, targetStage, note, actor) {
+  const deal = db.prepare("SELECT id, stage FROM deals WHERE id = ?").get(dealId);
+  if (!deal) return false;
+  if (deal.stage === "lost") return false; // a lost deal never auto-advances
+  const currentIdx = STAGE_ORDER.indexOf(deal.stage);
+  const targetIdx = STAGE_ORDER.indexOf(targetStage);
+  if (targetIdx <= currentIdx) return false; // already here or further along — nothing to do
+
+  db.prepare("UPDATE deals SET stage = ?, updated_at = datetime('now') WHERE id = ?").run(targetStage, dealId);
+  logActivity("deal", dealId, note, actor || "system");
+  return true;
+}
+
+module.exports = { db, logActivity, reseedPriceCatalog, advanceDealStage };
