@@ -1,6 +1,6 @@
 // routes/jobs.js
 const express = require("express");
-const { db, logActivity } = require("../db");
+const { db, logActivity, advanceDealStage } = require("../db");
 const googleCalendar = require("../services/googleCalendar");
 const { TIME_SLOT_KEYS } = require("../constants/timeSlots");
 
@@ -80,52 +80,6 @@ function nextRecurringDate(fromDate, interval) {
   else if (interval === "biweekly") base.setDate(base.getDate() + 14);
   else if (interval === "monthly") base.setMonth(base.getMonth() + 1);
   return base.toISOString().slice(0, 10);
-}
-
-// ---- Pipeline auto-advance ----------------------------------------
-// The Pipeline board has columns for Won, Scheduled, Complete, and
-// Invoiced — but until now only Won (on estimate accept) and Invoiced
-// (on payment, see routes/invoices.js) ever moved a deal there
-// automatically. Scheduled and Complete existed as columns nobody's
-// deals ever landed in without a manual drag. This closes that gap by
-// reading straight off the job(s) actually attached to the deal:
-//
-//   won        -> scheduled   as soon as ANY job for the deal has a date
-//   won/sched. -> complete    once EVERY job for the deal is finished
-//                              (complete or canceled), and at least one
-//                              of them actually completed
-//
-// A deal can have more than one job (recurring service, or a second
-// order added for the same customer), so "complete" deliberately waits
-// for all of them rather than firing on the first one done — otherwise
-// a deal with a still-open second job would jump to Complete early.
-// Never touches "lost" or "invoiced" deals, and never moves a deal
-// backwards.
-function maybeAdvanceDealStage(dealId, actorName) {
-  const deal = db.prepare("SELECT stage FROM deals WHERE id = ?").get(dealId);
-  if (!deal) return null;
-
-  const jobs = db.prepare("SELECT status, scheduled_date FROM jobs WHERE deal_id = ?").all(dealId);
-  if (jobs.length === 0) return null;
-
-  let newStage = null;
-
-  if (deal.stage === "won" && jobs.some((j) => j.scheduled_date)) {
-    newStage = "scheduled";
-  }
-
-  const effectiveStage = newStage || deal.stage;
-  if (["won", "scheduled"].includes(effectiveStage)) {
-    const allSettled = jobs.every((j) => j.status === "complete" || j.status === "canceled");
-    const anyComplete = jobs.some((j) => j.status === "complete");
-    if (allSettled && anyComplete) newStage = "complete";
-  }
-
-  if (!newStage || newStage === deal.stage) return null;
-
-  db.prepare("UPDATE deals SET stage = ?, updated_at = datetime('now') WHERE id = ?").run(newStage, dealId);
-  logActivity("deal", dealId, `Stage changed: ${deal.stage} \u2192 ${newStage} (automatic, from job status)`, actorName);
-  return newStage;
 }
 
 // GET /api/jobs — list, optionally filtered by date range (powers the calendar view)
@@ -232,7 +186,18 @@ router.post("/", async (req, res) => {
   const id = Number(result.lastInsertRowid);
   logActivity("job", id, `Job created (status: ${finalStatus})`, req.user && req.user.name);
 
-  const dealStageChange = maybeAdvanceDealStage(deal_id, req.user && req.user.name);
+  // Auto-advance: a job that exists with a real date on it means the
+  // work is genuinely scheduled, not just theoretically won. Forward-only
+  // (see advanceDealStage), so this never regresses a deal that's
+  // already further along.
+  if (scheduled_date) {
+    advanceDealStage(
+      deal_id,
+      "scheduled",
+      `Job #${id} scheduled for ${scheduled_date} \u2014 deal automatically moved to Scheduled`,
+      req.user && req.user.name
+    );
+  }
 
   // Calendar sync is best-effort and never blocks the response — if it's
   // not configured, or Google is briefly unreachable, the job is still
@@ -245,7 +210,7 @@ router.post("/", async (req, res) => {
     }
   }
 
-  res.status(201).json({ job: db.prepare("SELECT * FROM jobs WHERE id = ?").get(id), deal_stage_change: dealStageChange });
+  res.status(201).json({ job: db.prepare("SELECT * FROM jobs WHERE id = ?").get(id) });
 });
 
 // PATCH /api/jobs/:id
@@ -313,6 +278,19 @@ router.patch("/:id", async (req, res) => {
     logActivity("job", req.params.id, `Status changed: ${existing.status} \u2192 ${req.body.status}`, req.user && req.user.name);
   }
 
+  // Auto-advance: same rule as job creation — a job with a real date on
+  // it means the deal is genuinely scheduled. Safe to call on every
+  // update where a date is present, since advanceDealStage only ever
+  // moves forward and no-ops once the deal's already there.
+  if (req.body.scheduled_date) {
+    advanceDealStage(
+      existing.deal_id,
+      "scheduled",
+      `Job #${req.params.id} scheduled for ${req.body.scheduled_date} \u2014 deal automatically moved to Scheduled`,
+      req.user && req.user.name
+    );
+  }
+
   // ---- Job marked complete: two automations fire off the same moment ----
   let spawnedJob = null;
   if (req.body.status === "complete" && existing.status !== "complete") {
@@ -356,12 +334,6 @@ router.patch("/:id", async (req, res) => {
     logActivity("job", req.params.id, "Job complete \u2014 eligible for a review request", req.user && req.user.name);
   }
 
-  // Pipeline auto-advance — see maybeAdvanceDealStage above. Runs after
-  // the job row itself is saved so it sees the final state (including a
-  // brand-new recurring occurrence, which keeps a deal from jumping to
-  // Complete just because the job that spawned it finished).
-  const dealStageChange = maybeAdvanceDealStage(existing.deal_id, req.user && req.user.name);
-
   // Calendar sync: cancellation removes the event; anything else
   // (new date, address, notes, etc.) updates it. Best-effort, same as
   // on create — never blocks the response.
@@ -382,7 +354,6 @@ router.patch("/:id", async (req, res) => {
   res.json({
     job: { ...updated, equipment_ids: JSON.parse(updated.equipment_ids || "[]") },
     spawned_job: spawnedJob,
-    deal_stage_change: dealStageChange,
   });
 });
 

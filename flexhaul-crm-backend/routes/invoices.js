@@ -1,7 +1,7 @@
 // routes/invoices.js
 const express = require("express");
 const crypto = require("crypto");
-const { db, logActivity } = require("../db");
+const { db, logActivity, advanceDealStage } = require("../db");
 const { buildInvoicePdf } = require("../services/invoicePdf");
 
 const router = express.Router();
@@ -53,6 +53,17 @@ router.post("/", (req, res) => {
 
   const id = Number(result.lastInsertRowid);
   logActivity("job", job_id, `Invoice #${id} generated \u2014 $${Number(finalAmount).toFixed(2)}`, req.user && req.user.name);
+
+  // Auto-advance: a real invoice existing means the deal has genuinely
+  // reached "Invoiced" — forward-only, so this never fires for a deal
+  // that's already further along (e.g. already paid off and closed out).
+  advanceDealStage(
+    job.deal_id,
+    "invoiced",
+    `Invoice #${id} generated \u2014 deal automatically moved to Invoiced`,
+    req.user && req.user.name
+  );
+
   res.status(201).json({ invoice: db.prepare("SELECT * FROM invoices WHERE id = ?").get(id) });
 });
 
@@ -120,12 +131,7 @@ router.patch("/:id", (req, res) => {
     if (req.body.status === "paid") {
       const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(existing.job_id);
       if (job) {
-        // invoiced_at starts the 24-hour clock the Pipeline board uses to
-        // auto-archive this card (routes/deals.js GET /) — the full deal
-        // stays visible on the Customers tab indefinitely either way.
-        db.prepare(
-          "UPDATE deals SET stage = 'invoiced', invoiced_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND stage != 'invoiced'"
-        ).run(job.deal_id);
+        db.prepare("UPDATE deals SET stage = 'invoiced', updated_at = datetime('now') WHERE id = ? AND stage != 'invoiced'").run(job.deal_id);
         db.prepare("UPDATE jobs SET status = 'complete', updated_at = datetime('now') WHERE id = ? AND status != 'complete'").run(job.id);
       }
     }

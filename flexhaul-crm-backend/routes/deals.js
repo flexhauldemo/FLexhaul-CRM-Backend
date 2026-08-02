@@ -2,7 +2,6 @@
 const express = require("express");
 const { db, logActivity } = require("../db");
 const { requireAdmin } = require("../middleware/auth");
-const { createJobAndInvoice } = require("../services/estimateAcceptance");
 
 const router = express.Router();
 
@@ -37,17 +36,6 @@ router.post("/resync-values", requireAdmin, (req, res) => {
 
 // GET /api/deals — all deals, joined with customer name, optionally filtered by stage.
 // This is what powers the Kanban pipeline view.
-//
-// Deals that have been sitting at "invoiced" (= complete and paid, see
-// routes/invoices.js) for more than 24 hours are left out of the
-// unfiltered/default call — the board is meant to show active work, not
-// double as a permanent archive of everything ever closed. The full deal
-// is never deleted and stays fully visible from the Customers tab
-// (routes/customers.js GET /:id has no such filter) and from GET
-// /api/deals/:id directly — only the "give me everything for the board"
-// list is affected. An explicit ?stage=invoiced request bypasses this,
-// since asking for that stage by name is a deliberate request to see it.
-const PIPELINE_ARCHIVE_HOURS = 24;
 router.get("/", (req, res) => {
   const { stage } = req.query;
   let rows;
@@ -58,17 +46,7 @@ router.get("/", (req, res) => {
   if (stage) {
     rows = db.prepare(`${base} WHERE deals.stage = ? ORDER BY deals.updated_at DESC`).all(stage);
   } else {
-    rows = db
-      .prepare(
-        `${base}
-         WHERE NOT (
-           deals.stage = 'invoiced'
-           AND deals.invoiced_at IS NOT NULL
-           AND deals.invoiced_at <= datetime('now', '-${PIPELINE_ARCHIVE_HOURS} hours')
-         )
-         ORDER BY deals.updated_at DESC`
-      )
-      .all();
+    rows = db.prepare(`${base} ORDER BY deals.updated_at DESC`).all();
   }
   res.json({ deals: rows });
 });
@@ -87,11 +65,22 @@ router.get("/:id", (req, res) => {
 
   const estimates = db.prepare("SELECT * FROM estimates WHERE deal_id = ? ORDER BY created_at DESC").all(req.params.id);
   const jobs = db.prepare("SELECT * FROM jobs WHERE deal_id = ? ORDER BY created_at DESC").all(req.params.id);
+  // Invoices don't have a direct deal_id — they belong to a job, which
+  // belongs to a deal — so this joins through jobs to find every invoice
+  // tied to any job under this deal.
+  const invoices = db
+    .prepare(
+      `SELECT invoices.* FROM invoices
+       JOIN jobs ON jobs.id = invoices.job_id
+       WHERE jobs.deal_id = ?
+       ORDER BY invoices.created_at DESC`
+    )
+    .all(req.params.id);
   const activity = db
     .prepare("SELECT * FROM activity_log WHERE entity_type = 'deal' AND entity_id = ? ORDER BY created_at DESC LIMIT 50")
     .all(req.params.id);
 
-  res.json({ deal, estimates, jobs, activity });
+  res.json({ deal, estimates, jobs, invoices, activity });
 });
 
 // POST /api/deals
@@ -156,15 +145,6 @@ router.patch("/:id", (req, res) => {
     // ready to be dated from the Jobs screen or Calendar. Guarded so this
     // only ever fires once per deal, even if the stage gets set to "won"
     // again later (e.g. after being moved back and forward).
-    //
-    // Uses the SAME createJobAndInvoice helper as the estimate Accept
-    // button (services/estimateAcceptance.js) — previously this had its
-    // own separate copy of the insert logic that left out share_token,
-    // due_date, and line_items on the invoice, so a deal marked Won by
-    // dragging it on the board (instead of clicking Accept on an
-    // estimate) produced an invoice with no working customer payment
-    // link. Sharing one function means both paths always produce the
-    // same, complete result.
     if (req.body.stage === "won") {
       const alreadyHasJob = db.prepare("SELECT id FROM jobs WHERE deal_id = ?").get(req.params.id);
       const latestEstimate = db
@@ -180,23 +160,25 @@ router.patch("/:id", (req, res) => {
           )
           .get(req.params.id);
 
-        const { job, invoice } = createJobAndInvoice(
-          dealWithCustomer,
-          latestEstimate,
-          (req.user && req.user.name) || "Staff"
-        );
-        autoCreated = { job_id: job.id, invoice_id: invoice.id };
-      }
-    }
+        const jobResult = db
+          .prepare("INSERT INTO jobs (deal_id, status, address) VALUES (?, 'scheduled', ?)")
+          .run(req.params.id, dealWithCustomer.customer_address || null);
+        const jobId = Number(jobResult.lastInsertRowid);
+        logActivity("job", jobId, "Job auto-created — deal marked won with an agreed estimate", req.user && req.user.name);
 
-    // Mirrors the automatic stamp in routes/invoices.js (which fires when
-    // an invoice is actually marked paid) — this covers a deal being set
-    // to "invoiced" directly through this general PATCH path instead,
-    // e.g. a manual selection on the Pipeline board. Either way,
-    // invoiced_at needs a real value or the 24-hour auto-archive filter
-    // above has nothing to measure against.
-    if (req.body.stage === "invoiced") {
-      db.prepare("UPDATE deals SET invoiced_at = datetime('now') WHERE id = ?").run(req.params.id);
+        const invoiceResult = db
+          .prepare("INSERT INTO invoices (job_id, amount, status) VALUES (?, ?, 'unpaid')")
+          .run(jobId, latestEstimate.total);
+        const invoiceId = Number(invoiceResult.lastInsertRowid);
+        logActivity(
+          "job",
+          jobId,
+          `Invoice #${invoiceId} auto-created \u2014 $${Number(latestEstimate.total).toFixed(2)}`,
+          req.user && req.user.name
+        );
+
+        autoCreated = { job_id: jobId, invoice_id: invoiceId };
+      }
     }
   }
 
