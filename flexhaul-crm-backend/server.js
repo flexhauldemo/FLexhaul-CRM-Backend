@@ -68,6 +68,7 @@ app.use("/api/customers", requireAuth, customerRoutes);
 app.use("/api/deals", requireAuth, dealRoutes);
 app.use("/api/estimates", requireAuth, estimateRoutes);
 app.use("/api/jobs", requireAuth, jobRoutes);
+app.use("/api/admin", requireAuth, require("./routes/resetData"));
 app.use("/api/crews", requireAuth, crewRoutes);
 app.use("/api/equipment", requireAuth, equipmentRoutes);
 app.use("/api/documents", requireAuth, documentRoutes);
