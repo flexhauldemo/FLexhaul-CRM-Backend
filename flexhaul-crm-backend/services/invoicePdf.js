@@ -36,7 +36,7 @@ function buildInvoicePdf(invoice) {
     // ---- Header ----
     doc.fontSize(22).fillColor(INK).font("Helvetica-Bold").text("FlexHaul & Demolition LLC", 50, 50);
     doc.fontSize(10).fillColor(STEEL).font("Helvetica").text("Lafayette, IN & surrounding communities", 50, 76);
-    doc.text("(765) 885-6317  \u00b7  Info.flexhaul@gmail.com", 50, 90);
+    doc.text("(765) 885-6137  \u00b7  Info.flexhaul@gmail.com", 50, 90);
 
     doc.fontSize(20).fillColor(RUST).font("Helvetica-Bold").text("INVOICE", 400, 50, { align: "right" });
     doc.fontSize(10).fillColor(STEEL).font("Helvetica").text(`Invoice #FH-${String(invoice.id).padStart(4, "0")}`, 400, 76, { align: "right" });
@@ -100,7 +100,7 @@ function buildInvoicePdf(invoice) {
 
     // ---- Footer ----
     doc.fontSize(9).fillColor(STEEL).font("Helvetica").text(
-      "Thank you for choosing FlexHaul & Demolition. Questions about this invoice? Call or text (765) 885-6317.",
+      "Thank you for choosing FlexHaul & Demolition. Questions about this invoice? Call or text (765) 885-6137.",
       50,
       720,
       { width: 512, align: "center" }

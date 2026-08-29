@@ -48,7 +48,7 @@ async function sendAppointmentConfirmation(job, phone) {
     `FlexHaul & Demolition: You're confirmed for ${dateStr}` +
     (timeStr ? `, ${timeStr}` : "") +
     (job.address ? ` at ${job.address}` : "") +
-    `. Questions? Call/text (765) 885-6317.`;
+    `. Questions? Call/text (765) 885-6137.`;
   return sendSms(phone, body);
 }
 
@@ -60,7 +60,7 @@ async function sendAppointmentReminder(job, phone) {
     `FlexHaul & Demolition: Reminder \u2014 we're scheduled for you tomorrow, ${dateStr}` +
     (timeStr ? `, ${timeStr}` : "") +
     (job.address ? ` at ${job.address}` : "") +
-    `. Reply or call (765) 885-6317 if anything's changed.`;
+    `. Reply or call (765) 885-6137 if anything's changed.`;
   return sendSms(phone, body);
 }
 
