@@ -11,7 +11,9 @@ const RECURRING_INTERVALS = ["weekly", "biweekly", "monthly"];
 function getJobWithCustomer(id) {
   return db
     .prepare(
-      `SELECT jobs.*, customers.name AS customer_name, customers.phone AS customer_phone
+      `SELECT jobs.*, customers.id AS customer_id, customers.name AS customer_name,
+              customers.phone AS customer_phone, customers.email AS customer_email,
+              customers.address AS customer_address
        FROM jobs
        JOIN deals ON deals.id = jobs.deal_id
        JOIN customers ON customers.id = deals.customer_id
@@ -70,7 +72,8 @@ function nextRecurringDate(fromDate, interval) {
 router.get("/", (req, res) => {
   const { date } = req.query;
   let sql = `
-    SELECT jobs.*, customers.name AS customer_name, customers.phone AS customer_phone, crews.name AS crew_name
+    SELECT jobs.*, customers.id AS customer_id, customers.name AS customer_name,
+           customers.phone AS customer_phone, crews.name AS crew_name
     FROM jobs
     JOIN deals ON deals.id = jobs.deal_id
     JOIN customers ON customers.id = deals.customer_id
@@ -90,7 +93,20 @@ router.get("/:id", (req, res) => {
   const job = getJobWithCustomer(req.params.id);
   if (!job) return res.status(404).json({ error: "Job not found" });
   const documents = db.prepare("SELECT * FROM documents WHERE job_id = ? ORDER BY uploaded_at DESC").all(req.params.id);
-  res.json({ job: { ...job, equipment_ids: JSON.parse(job.equipment_ids || "[]") }, documents });
+  const invoices = db.prepare("SELECT * FROM invoices WHERE job_id = ? ORDER BY created_at DESC").all(req.params.id);
+  // Every other job this same customer has had with us — the "history"
+  // a crew member wants at a glance when they tap into a job: is this a
+  // repeat customer, how did the last visit go, anything unresolved.
+  const history = db
+    .prepare(
+      `SELECT jobs.id, jobs.status, jobs.scheduled_date, jobs.address
+       FROM jobs
+       JOIN deals ON deals.id = jobs.deal_id
+       WHERE deals.customer_id = ? AND jobs.id != ?
+       ORDER BY jobs.scheduled_date DESC`
+    )
+    .all(job.customer_id, job.id);
+  res.json({ job: { ...job, equipment_ids: JSON.parse(job.equipment_ids || "[]") }, documents, invoices, history });
 });
 
 router.post("/", async (req, res) => {
