@@ -64,4 +64,21 @@ async function sendAppointmentReminder(job, phone) {
   return sendSms(phone, body);
 }
 
-module.exports = { isConfigured, sendSms, sendAppointmentConfirmation, sendAppointmentReminder, toE164 };
+// Fires once, automatically, the moment a job's invoice is marked paid
+// in full — right when the experience is freshest and a customer is
+// most likely to actually leave a review. Needs GOOGLE_REVIEW_LINK set
+// as an environment variable (your Google Business Profile's short
+// review link) — without it, this quietly does nothing rather than
+// texting a broken or missing link.
+async function sendReviewRequest(phone) {
+  const link = process.env.GOOGLE_REVIEW_LINK;
+  if (!link) {
+    console.warn("GOOGLE_REVIEW_LINK is not set — skipping review request SMS.");
+    return false;
+  }
+  const body =
+    `FlexHaul & Demolition: Thanks for choosing us! If you have a minute, a Google review really helps a small local crew like ours \u2014 ${link}`;
+  return sendSms(phone, body);
+}
+
+module.exports = { isConfigured, sendSms, sendAppointmentConfirmation, sendAppointmentReminder, sendReviewRequest, toE164 };
