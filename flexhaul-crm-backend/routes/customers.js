@@ -61,7 +61,30 @@ router.get("/:id", (req, res) => {
     )
     .all(req.params.id);
 
-  res.json({ customer, deals, upcoming_jobs: upcomingJobs, past_jobs: pastJobs, activity });
+  // Lifetime value — every invoice this customer has actually paid,
+  // across every deal and job they've ever had, regardless of whether
+  // that deal is still open or already archived. This is the number
+  // that answers "is this a repeat customer worth prioritizing," at a
+  // glance, without digging through their whole history.
+  const ltv = db
+    .prepare(
+      `SELECT COALESCE(SUM(invoices.amount), 0) AS total, COUNT(*) AS job_count
+       FROM invoices
+       JOIN jobs ON jobs.id = invoices.job_id
+       JOIN deals ON deals.id = jobs.deal_id
+       WHERE deals.customer_id = ? AND invoices.status = 'paid'`
+    )
+    .get(req.params.id);
+
+  res.json({
+    customer,
+    deals,
+    upcoming_jobs: upcomingJobs,
+    past_jobs: pastJobs,
+    activity,
+    lifetime_value: ltv.total,
+    completed_job_count: ltv.job_count,
+  });
 });
 
 // POST /api/customers
