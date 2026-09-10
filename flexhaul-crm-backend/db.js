@@ -444,4 +444,20 @@ function advanceDealStage(dealId, targetStage, note, actor) {
   return true;
 }
 
-module.exports = { db, logActivity, reseedPriceCatalog, advanceDealStage };
+// A deal's displayed dollar value should always reflect the estimate
+// real money is actually committed to, once one exists — never
+// whichever estimate happens to have been created or edited most
+// recently. If an accepted estimate exists, its total wins, full stop;
+// only when nothing has been accepted yet does the deal fall back to
+// showing the latest estimate as a running "current best quote."
+function syncDealValue(dealId) {
+  const accepted = db
+    .prepare("SELECT total FROM estimates WHERE deal_id = ? AND accepted = 1 ORDER BY updated_at DESC LIMIT 1")
+    .get(dealId);
+  const value = accepted
+    ? accepted.total
+    : (db.prepare("SELECT total FROM estimates WHERE deal_id = ? ORDER BY created_at DESC LIMIT 1").get(dealId) || { total: 0 }).total;
+  db.prepare("UPDATE deals SET estimated_value = ?, updated_at = datetime('now') WHERE id = ?").run(value, dealId);
+}
+
+module.exports = { db, logActivity, reseedPriceCatalog, advanceDealStage, syncDealValue };
