@@ -43,10 +43,12 @@ router.get("/", (req, res) => {
     SELECT deals.*, customers.name AS customer_name, customers.phone AS customer_phone
     FROM deals JOIN customers ON customers.id = deals.customer_id
   `;
+  // Archived deals (Lost or paid-in-full Complete) have their own home on
+  // the Archive screen — the Pipeline board only ever shows live work.
   if (stage) {
-    rows = db.prepare(`${base} WHERE deals.stage = ? ORDER BY deals.updated_at DESC`).all(stage);
+    rows = db.prepare(`${base} WHERE deals.stage = ? AND deals.archived_at IS NULL ORDER BY deals.updated_at DESC`).all(stage);
   } else {
-    rows = db.prepare(`${base} ORDER BY deals.updated_at DESC`).all();
+    rows = db.prepare(`${base} WHERE deals.archived_at IS NULL ORDER BY deals.updated_at DESC`).all();
   }
   res.json({ deals: rows });
 });
@@ -112,7 +114,7 @@ router.patch("/:id", (req, res) => {
     return res.status(400).json({ error: `stage must be one of: ${VALID_STAGES.join(", ")}` });
   }
 
-  const fields = ["stage", "source", "estimated_value", "notes", "service_type"];
+  const fields = ["stage", "source", "estimated_value", "notes", "service_type", "lost_reason"];
   const updates = [];
   const values = [];
   fields.forEach((f) => {
@@ -179,6 +181,25 @@ router.patch("/:id", (req, res) => {
 
         autoCreated = { job_id: jobId, invoice_id: invoiceId };
       }
+    }
+
+    // A deal marked Lost leaves the Pipeline immediately. The itemized
+    // estimate (pricing, line items — what was actually quoted) is
+    // deleted rather than kept, since a declined quote isn't useful to
+    // hang onto in detail. The customer record and the deal itself stay,
+    // along with why it was lost, so there's still something to work
+    // with for a future win-back attempt.
+    if (req.body.stage === "lost") {
+      const deletedEstimates = db.prepare("DELETE FROM estimates WHERE deal_id = ?").run(req.params.id);
+      db.prepare("UPDATE deals SET archived_at = datetime('now') WHERE id = ?").run(req.params.id);
+      logActivity(
+        "deal",
+        req.params.id,
+        deletedEstimates.changes > 0
+          ? `Marked Lost \u2014 archived, and ${deletedEstimates.changes} estimate${deletedEstimates.changes === 1 ? "" : "s"} cleared`
+          : "Marked Lost \u2014 archived",
+        req.user && req.user.name
+      );
     }
   }
 
