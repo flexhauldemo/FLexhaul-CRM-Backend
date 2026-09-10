@@ -1,6 +1,6 @@
 // routes/deals.js
 const express = require("express");
-const { db, logActivity } = require("../db");
+const { db, logActivity, syncDealValue } = require("../db");
 const { requireAdmin } = require("../middleware/auth");
 
 const router = express.Router();
@@ -8,27 +8,19 @@ const router = express.Router();
 const VALID_STAGES = ["new_lead", "quoted", "won", "scheduled", "complete", "invoiced", "lost"];
 
 // POST /api/deals/resync-values — admin-only, one-time cleanup tool.
-// Fixes deals whose estimate was created before the automatic sync (added
-// to estimates.js) existed — those deals are permanently stuck showing
-// $0 even though a real estimate is attached, since nothing ever wrote
-// that number back onto the deal. Safe to run more than once; it only
-// ever sets a deal's value to match its own most recent estimate, never
-// touches deals with no estimate at all.
+// Fixes deals whose value has drifted from what it should actually show.
+// Uses the same rule everywhere else does: an accepted estimate's total
+// always wins over any other (unaccepted) estimate on the same deal, no
+// matter which was created more recently. Safe to run more than once.
 router.post("/resync-values", requireAdmin, (req, res) => {
   const deals = db.prepare("SELECT id, estimated_value FROM deals").all();
   let updated = 0;
 
   deals.forEach((deal) => {
-    const latestEstimate = db
-      .prepare("SELECT total FROM estimates WHERE deal_id = ? ORDER BY created_at DESC LIMIT 1")
-      .get(deal.id);
-    if (latestEstimate && latestEstimate.total !== deal.estimated_value) {
-      db.prepare("UPDATE deals SET estimated_value = ?, updated_at = datetime('now') WHERE id = ?").run(
-        latestEstimate.total,
-        deal.id
-      );
-      updated++;
-    }
+    const before = deal.estimated_value;
+    syncDealValue(deal.id);
+    const after = db.prepare("SELECT estimated_value FROM deals WHERE id = ?").get(deal.id).estimated_value;
+    if (after !== before) updated++;
   });
 
   res.json({ ok: true, dealsChecked: deals.length, dealsUpdated: updated });
@@ -178,6 +170,15 @@ router.patch("/:id", (req, res) => {
           `Invoice #${invoiceId} auto-created \u2014 $${Number(latestEstimate.total).toFixed(2)}`,
           req.user && req.user.name
         );
+
+        // This is the estimate a real job and invoice now depend on, even
+        // though nobody clicked an explicit "Accept" button — mark it the
+        // same way that button would, so it locks from editing/deletion
+        // exactly like an explicitly-accepted one does. Any OTHER
+        // estimate sitting on this deal (an old draft, a duplicate) is
+        // untouched and stays freely editable.
+        db.prepare("UPDATE estimates SET accepted = 1, customer_approved_at = COALESCE(customer_approved_at, datetime('now')) WHERE id = ?").run(latestEstimate.id);
+        syncDealValue(req.params.id);
 
         autoCreated = { job_id: jobId, invoice_id: invoiceId };
       }
