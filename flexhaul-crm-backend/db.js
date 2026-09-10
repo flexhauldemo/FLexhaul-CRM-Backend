@@ -224,6 +224,19 @@ if (!documentsColumns.includes("expires_at")) {
   db.exec("ALTER TABLE documents ADD COLUMN expires_at TEXT;");
 }
 
+// Archiving — deals leave the Pipeline once they're truly done (paid in
+// full) or truly dead (marked Lost), instead of piling up in a "Closed"
+// section forever. archived_at is the switch a deal query filters on;
+// lost_reason is captured once, at the moment a deal is marked Lost, for
+// win/loss reporting later.
+const dealsColumns3 = db.prepare("PRAGMA table_info(deals)").all().map((c) => c.name);
+if (!dealsColumns3.includes("archived_at")) {
+  db.exec("ALTER TABLE deals ADD COLUMN archived_at TEXT;");
+}
+if (!dealsColumns3.includes("lost_reason")) {
+  db.exec("ALTER TABLE deals ADD COLUMN lost_reason TEXT;");
+}
+
 // Backfill share_token for any estimates created before this feature
 // existed, so the public link works for old data too, not just new.
 db.exec(`
