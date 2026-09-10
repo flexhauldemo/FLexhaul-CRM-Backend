@@ -7,6 +7,23 @@ const { acceptEstimate, AcceptanceError } = require("../services/estimateAccepta
 
 const router = express.Router();
 
+// Once a deal has moved past these two stages, at least one estimate has
+// been accepted (or the deal was won by hand) and a job/invoice may
+// already be built on top of an estimate's numbers. Editing or deleting
+// an estimate at that point could silently desync a real invoice from
+// what it's supposed to be billing, so it's locked from here on out —
+// the only way to change the price after winning is a fresh estimate or
+// a manual invoice edit, both deliberate, visible actions.
+const EDITABLE_STAGES = ["new_lead", "quoted"];
+
+function getEditabilityInfo(estimateId) {
+  const estimate = db.prepare("SELECT * FROM estimates WHERE id = ?").get(estimateId);
+  if (!estimate) return { estimate: null, deal: null, editable: false };
+  const deal = db.prepare("SELECT * FROM deals WHERE id = ?").get(estimate.deal_id);
+  const editable = !estimate.accepted && !!deal && EDITABLE_STAGES.includes(deal.stage);
+  return { estimate, deal, editable };
+}
+
 // Line items look like:
 //   { type: 'labor'|'equipment'|'disposal'|'tonnage'|'cubic_yards'|'other',
 //     label: string, qty: number, unit: string, rate: number, amount: number }
@@ -24,7 +41,8 @@ function computeTotal(lineItems) {
 router.get("/:id", (req, res) => {
   const row = db.prepare("SELECT * FROM estimates WHERE id = ?").get(req.params.id);
   if (!row) return res.status(404).json({ error: "Estimate not found" });
-  res.json({ estimate: { ...row, line_items: JSON.parse(row.line_items) } });
+  const { editable } = getEditabilityInfo(req.params.id);
+  res.json({ estimate: { ...row, line_items: JSON.parse(row.line_items), editable } });
 });
 
 // POST /api/estimates — create against a deal
@@ -55,10 +73,19 @@ router.post("/", (req, res) => {
   res.status(201).json({ estimate: { ...db.prepare("SELECT * FROM estimates WHERE id = ?").get(id), line_items: items } });
 });
 
-// PATCH /api/estimates/:id — replace line items, total is recalculated
+// PATCH /api/estimates/:id — replace line items, total is recalculated.
+// Blocked once the deal has moved past new_lead/quoted — see
+// EDITABLE_STAGES above.
 router.patch("/:id", (req, res) => {
-  const existing = db.prepare("SELECT * FROM estimates WHERE id = ?").get(req.params.id);
+  const { estimate: existing, deal, editable } = getEditabilityInfo(req.params.id);
   if (!existing) return res.status(404).json({ error: "Estimate not found" });
+  if (!editable) {
+    return res.status(400).json({
+      error: existing.accepted
+        ? "This estimate has already been accepted and can't be edited. Create a new estimate instead."
+        : `This deal is already ${deal ? deal.stage : "past quoting"} — estimates can only be edited while a deal is still New Lead or Quoted.`,
+    });
+  }
 
   const items = Array.isArray(req.body.line_items) ? req.body.line_items : JSON.parse(existing.line_items);
   const total = computeTotal(items);
@@ -75,6 +102,35 @@ router.patch("/:id", (req, res) => {
 
   logActivity("estimate", req.params.id, `Estimate updated — total $${total.toFixed(2)}`, req.user && req.user.name);
   res.json({ estimate: { ...db.prepare("SELECT * FROM estimates WHERE id = ?").get(req.params.id), line_items: items } });
+});
+
+// DELETE /api/estimates/:id — same "not won yet" guard as editing.
+router.delete("/:id", (req, res) => {
+  const { estimate: existing, deal, editable } = getEditabilityInfo(req.params.id);
+  if (!existing) return res.status(404).json({ error: "Estimate not found" });
+  if (!editable) {
+    return res.status(400).json({
+      error: existing.accepted
+        ? "This estimate has already been accepted and can't be deleted."
+        : `This deal is already ${deal ? deal.stage : "past quoting"} — estimates can only be deleted while a deal is still New Lead or Quoted.`,
+    });
+  }
+
+  db.prepare("DELETE FROM estimates WHERE id = ?").run(req.params.id);
+
+  // The deal's displayed value should fall back to whatever estimate (if
+  // any) is now the most recent, rather than keep showing a price for an
+  // estimate that no longer exists.
+  const nextLatest = db
+    .prepare("SELECT total FROM estimates WHERE deal_id = ? ORDER BY created_at DESC LIMIT 1")
+    .get(existing.deal_id);
+  db.prepare("UPDATE deals SET estimated_value = ?, updated_at = datetime('now') WHERE id = ?").run(
+    nextLatest ? nextLatest.total : 0,
+    existing.deal_id
+  );
+
+  logActivity("estimate", req.params.id, `Estimate deleted (was $${Number(existing.total).toFixed(2)})`, req.user && req.user.name);
+  res.json({ ok: true });
 });
 
 // POST /api/estimates/:id/accept — the "customer said yes" button.
@@ -98,3 +154,4 @@ router.post("/:id/accept", (req, res) => {
 });
 
 module.exports = router;
+
