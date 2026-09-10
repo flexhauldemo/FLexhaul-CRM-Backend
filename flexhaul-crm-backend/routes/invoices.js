@@ -3,6 +3,7 @@ const express = require("express");
 const crypto = require("crypto");
 const { db, logActivity, advanceDealStage } = require("../db");
 const { buildInvoicePdf } = require("../services/invoicePdf");
+const smsNotifications = require("../services/smsNotifications");
 
 const router = express.Router();
 const VALID_STATUSES = ["unpaid", "paid", "overdue"];
@@ -96,7 +97,7 @@ router.get("/:id/pdf", async (req, res) => {
 });
 
 // PATCH /api/invoices/:id — mark paid/unpaid/overdue
-router.patch("/:id", (req, res) => {
+router.patch("/:id", async (req, res) => {
   const existing = db.prepare("SELECT * FROM invoices WHERE id = ?").get(req.params.id);
   if (!existing) return res.status(404).json({ error: "Invoice not found" });
 
@@ -133,6 +134,33 @@ router.patch("/:id", (req, res) => {
       if (job) {
         db.prepare("UPDATE deals SET stage = 'invoiced', updated_at = datetime('now') WHERE id = ? AND stage != 'invoiced'").run(job.deal_id);
         db.prepare("UPDATE jobs SET status = 'complete', updated_at = datetime('now') WHERE id = ? AND status != 'complete'").run(job.id);
+        // Fully paid means fully done — archive the deal off the Pipeline.
+        // Nothing is deleted here (unlike a Lost deal): the estimate, the
+        // job, this invoice, and every document stay attached exactly as
+        // they are, since this is now a real completed job record.
+        db.prepare("UPDATE deals SET archived_at = datetime('now') WHERE id = ? AND archived_at IS NULL").run(job.deal_id);
+        logActivity("deal", job.deal_id, "Invoice paid in full \u2014 archived as Completed", req.user && req.user.name);
+
+        // Completed AND paid, in the same instant — the exact moment to
+        // ask for a Google review, while the job's still fresh. Guarded
+        // by review_requested so this only ever fires once per job, even
+        // if an invoice gets toggled paid/unpaid/paid again later.
+        if (!job.review_requested && smsNotifications.isConfigured()) {
+          const customer = db
+            .prepare(
+              `SELECT customers.phone AS phone
+               FROM deals JOIN customers ON customers.id = deals.customer_id
+               WHERE deals.id = ?`
+            )
+            .get(job.deal_id);
+          if (customer && customer.phone) {
+            const sent = await smsNotifications.sendReviewRequest(customer.phone);
+            if (sent) {
+              db.prepare("UPDATE jobs SET review_requested = 1 WHERE id = ?").run(job.id);
+              logActivity("job", job.id, "Google review request text sent", "system");
+            }
+          }
+        }
       }
     }
   }
