@@ -2,26 +2,23 @@ const crypto = require("crypto");
 
 // routes/estimates.js
 const express = require("express");
-const { db, logActivity } = require("../db");
+const { db, logActivity, syncDealValue } = require("../db");
 const { acceptEstimate, AcceptanceError } = require("../services/estimateAcceptance");
 
 const router = express.Router();
 
-// Once a deal has moved past these two stages, at least one estimate has
-// been accepted (or the deal was won by hand) and a job/invoice may
-// already be built on top of an estimate's numbers. Editing or deleting
-// an estimate at that point could silently desync a real invoice from
-// what it's supposed to be billing, so it's locked from here on out —
-// the only way to change the price after winning is a fresh estimate or
-// a manual invoice edit, both deliberate, visible actions.
-const EDITABLE_STAGES = ["new_lead", "quoted"];
-
+// The only thing that locks an estimate is being the one actually relied
+// on for money already committed — i.e. it's been accepted (whether via
+// the explicit Accept button, or because it was the estimate used when a
+// deal got marked Won by hand). Nothing else about the deal matters: a
+// leftover draft or duplicate estimate that was never accepted stays
+// editable and deletable no matter what stage the deal has since moved
+// to, because nothing downstream depends on its numbers.
 function getEditabilityInfo(estimateId) {
   const estimate = db.prepare("SELECT * FROM estimates WHERE id = ?").get(estimateId);
   if (!estimate) return { estimate: null, deal: null, editable: false };
   const deal = db.prepare("SELECT * FROM deals WHERE id = ?").get(estimate.deal_id);
-  const editable = !estimate.accepted && !!deal && EDITABLE_STAGES.includes(deal.stage);
-  return { estimate, deal, editable };
+  return { estimate, deal, editable: !estimate.accepted };
 }
 
 // Line items look like:
@@ -63,27 +60,23 @@ router.post("/", (req, res) => {
 
   const id = Number(result.lastInsertRowid);
 
-  // Keep the deal's dollar value in sync with its estimate — otherwise a
-  // deal that started at $0 (e.g. from a website inquiry, which has no
-  // price yet) would keep showing as $0 on the Pipeline board and
-  // Dashboard even after a real estimate is attached to it.
-  db.prepare("UPDATE deals SET estimated_value = ?, updated_at = datetime('now') WHERE id = ?").run(total, deal_id);
+  // Keep the deal's dollar value in sync — but never at the expense of
+  // an already-accepted estimate's total (see syncDealValue above).
+  syncDealValue(deal_id);
 
   logActivity("estimate", id, `Estimate created — total $${total.toFixed(2)}`, req.user && req.user.name);
   res.status(201).json({ estimate: { ...db.prepare("SELECT * FROM estimates WHERE id = ?").get(id), line_items: items } });
 });
 
 // PATCH /api/estimates/:id — replace line items, total is recalculated.
-// Blocked once the deal has moved past new_lead/quoted — see
-// EDITABLE_STAGES above.
+// Blocked once this specific estimate has been accepted — see
+// getEditabilityInfo above.
 router.patch("/:id", (req, res) => {
-  const { estimate: existing, deal, editable } = getEditabilityInfo(req.params.id);
+  const { estimate: existing, editable } = getEditabilityInfo(req.params.id);
   if (!existing) return res.status(404).json({ error: "Estimate not found" });
   if (!editable) {
     return res.status(400).json({
-      error: existing.accepted
-        ? "This estimate has already been accepted and can't be edited. Create a new estimate instead."
-        : `This deal is already ${deal ? deal.stage : "past quoting"} — estimates can only be edited while a deal is still New Lead or Quoted.`,
+      error: "This estimate has already been accepted and can't be edited. Create a new estimate instead.",
     });
   }
 
@@ -96,38 +89,22 @@ router.patch("/:id", (req, res) => {
     req.params.id
   );
 
-  // Same sync as on creation — an edited estimate should immediately
-  // update what the deal is worth everywhere it's shown.
-  db.prepare("UPDATE deals SET estimated_value = ?, updated_at = datetime('now') WHERE id = ?").run(total, existing.deal_id);
+  syncDealValue(existing.deal_id);
 
   logActivity("estimate", req.params.id, `Estimate updated — total $${total.toFixed(2)}`, req.user && req.user.name);
   res.json({ estimate: { ...db.prepare("SELECT * FROM estimates WHERE id = ?").get(req.params.id), line_items: items } });
 });
 
-// DELETE /api/estimates/:id — same "not won yet" guard as editing.
+// DELETE /api/estimates/:id — same "not accepted yet" guard as editing.
 router.delete("/:id", (req, res) => {
-  const { estimate: existing, deal, editable } = getEditabilityInfo(req.params.id);
+  const { estimate: existing, editable } = getEditabilityInfo(req.params.id);
   if (!existing) return res.status(404).json({ error: "Estimate not found" });
   if (!editable) {
-    return res.status(400).json({
-      error: existing.accepted
-        ? "This estimate has already been accepted and can't be deleted."
-        : `This deal is already ${deal ? deal.stage : "past quoting"} — estimates can only be deleted while a deal is still New Lead or Quoted.`,
-    });
+    return res.status(400).json({ error: "This estimate has already been accepted and can't be deleted." });
   }
 
   db.prepare("DELETE FROM estimates WHERE id = ?").run(req.params.id);
-
-  // The deal's displayed value should fall back to whatever estimate (if
-  // any) is now the most recent, rather than keep showing a price for an
-  // estimate that no longer exists.
-  const nextLatest = db
-    .prepare("SELECT total FROM estimates WHERE deal_id = ? ORDER BY created_at DESC LIMIT 1")
-    .get(existing.deal_id);
-  db.prepare("UPDATE deals SET estimated_value = ?, updated_at = datetime('now') WHERE id = ?").run(
-    nextLatest ? nextLatest.total : 0,
-    existing.deal_id
-  );
+  syncDealValue(existing.deal_id);
 
   logActivity("estimate", req.params.id, `Estimate deleted (was $${Number(existing.total).toFixed(2)})`, req.user && req.user.name);
   res.json({ ok: true });
