@@ -17,7 +17,7 @@
 // appearing at the same instant as "Won" would have skipped straight to
 // "Invoiced" before anything was even scheduled.
 
-const { db, logActivity } = require("../db");
+const { db, logActivity, syncDealValue } = require("../db");
 
 class AcceptanceError extends Error {
   constructor(message, status) {
@@ -49,6 +49,31 @@ function acceptEstimate(estimateId, approvedBy) {
     db.prepare("UPDATE deals SET stage = 'won', updated_at = datetime('now') WHERE id = ?").run(deal.id);
   }
 
+  // The accepted estimate is now the deal's real, committed price —
+  // make sure that's what shows everywhere, regardless of whether some
+  // other (unaccepted) estimate happened to be created more recently.
+  syncDealValue(deal.id);
+
+  // A deal only ever gets ONE job out of this flow. If a leftover draft
+  // or a revised estimate on the same deal gets accepted after a job
+  // already exists — which is exactly what "Accept" buttons on old
+  // duplicate estimates make possible — this must not spawn a second,
+  // duplicate job. The existing job just inherits the new agreed price.
+  const existingJob = db.prepare("SELECT * FROM jobs WHERE deal_id = ? ORDER BY created_at ASC LIMIT 1").get(deal.id);
+  if (existingJob) {
+    logActivity(
+      "deal",
+      deal.id,
+      `A different estimate ($${estimate.total.toFixed(2)}) was accepted by ${approvedBy} \u2014 job #${existingJob.id} already exists, so no new job was created; the deal's value was updated instead.`,
+      approvedBy
+    );
+    return {
+      estimate: db.prepare("SELECT * FROM estimates WHERE id = ?").get(estimate.id),
+      job: existingJob,
+      job_already_existed: true,
+    };
+  }
+
   const jobResult = db
     .prepare("INSERT INTO jobs (deal_id, status, address, notes) VALUES (?, 'scheduled', ?, ?)")
     .run(
@@ -68,6 +93,7 @@ function acceptEstimate(estimateId, approvedBy) {
   return {
     estimate: db.prepare("SELECT * FROM estimates WHERE id = ?").get(estimate.id),
     job: db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId),
+    job_already_existed: false,
   };
 }
 
