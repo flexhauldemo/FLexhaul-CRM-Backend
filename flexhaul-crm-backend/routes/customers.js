@@ -108,13 +108,51 @@ router.patch("/:id", (req, res) => {
   const existing = db.prepare("SELECT * FROM customers WHERE id = ?").get(req.params.id);
   if (!existing) return res.status(404).json({ error: "Customer not found" });
 
+  // If the phone or email being saved already belongs to a DIFFERENT
+  // customer, warn rather than silently proceed — this is exactly the
+  // kind of mistake that quietly links two different people's history
+  // together. But don't hard-block it either: a shared household phone
+  // is a real, legitimate case, so the caller can explicitly confirm
+  // past this with confirm_collision and it goes through as normal.
+  if (!req.body.confirm_collision) {
+    if (req.body.phone !== undefined && req.body.phone && req.body.phone !== existing.phone) {
+      const collision = db
+        .prepare("SELECT id, name FROM customers WHERE phone = ? AND id != ?")
+        .get(req.body.phone, req.params.id);
+      if (collision) {
+        return res.status(409).json({
+          error: `This phone number is already on file for ${collision.name}.`,
+          field: "phone",
+          conflictingCustomer: collision,
+        });
+      }
+    }
+    if (req.body.email !== undefined && req.body.email && req.body.email !== existing.email) {
+      const collision = db
+        .prepare("SELECT id, name FROM customers WHERE email = ? AND id != ?")
+        .get(req.body.email, req.params.id);
+      if (collision) {
+        return res.status(409).json({
+          error: `This email address is already on file for ${collision.name}.`,
+          field: "email",
+          conflictingCustomer: collision,
+        });
+      }
+    }
+  }
+
   const fields = ["name", "type", "phone", "email", "address", "notes"];
   const updates = [];
   const values = [];
   fields.forEach((f) => {
     if (req.body[f] !== undefined) {
+      // Trim consistently with how a website inquiry's contact info is
+      // cleaned (see routes/publicInquiries.js) — a wandering space at
+      // the start/end of a hand-typed correction shouldn't be able to
+      // make an otherwise-matching phone number fail to match later.
+      const value = typeof req.body[f] === "string" ? req.body[f].trim() : req.body[f];
       updates.push(`${f} = ?`);
-      values.push(req.body[f]);
+      values.push(value === "" ? null : value);
     }
   });
   if (updates.length === 0) return res.status(400).json({ error: "No fields to update" });
