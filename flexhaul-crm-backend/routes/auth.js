@@ -2,13 +2,28 @@
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit");
 const { db } = require("../db");
 const { requireAuth, requireAdmin, JWT_SECRET } = require("../middleware/auth");
 
 const router = express.Router();
 
+// Slows down password-guessing — 10 attempts per 15 minutes per IP is
+// generous for a real person mistyping their password, but throttles
+// an automated brute-force attempt to a crawl. Scoped to this one
+// route specifically, not the whole /api/auth mount, so it never risks
+// throttling some other, more frequently-called endpoint under the
+// same path in the future.
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many login attempts. Please wait a few minutes and try again." },
+});
+
 // POST /api/auth/login — the only unauthenticated route in the whole API.
-router.post("/login", (req, res) => {
+router.post("/login", loginLimiter, (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) {
     return res.status(400).json({ error: "Email and password are required" });
