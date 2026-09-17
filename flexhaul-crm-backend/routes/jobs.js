@@ -1,5 +1,5 @@
 const express = require("express");
-const { db, logActivity, advanceDealStage } = require("../db");
+const { db, logActivity, advanceDealStage, sweepDueArchiving } = require("../db");
 const googleCalendar = require("../services/googleCalendar");
 const smsNotifications = require("../services/smsNotifications");
 const { TIME_SLOT_KEYS } = require("../constants/timeSlots");
@@ -70,6 +70,7 @@ function nextRecurringDate(fromDate, interval) {
 }
 
 router.get("/", (req, res) => {
+  sweepDueArchiving();
   const { date } = req.query;
   let sql = `
     SELECT jobs.*, customers.id AS customer_id, customers.name AS customer_name,
@@ -80,9 +81,19 @@ router.get("/", (req, res) => {
     LEFT JOIN crews ON crews.id = jobs.crew_id
   `;
   const params = [];
+  const conditions = [];
   if (date) {
-    sql += " WHERE jobs.scheduled_date = ?";
+    conditions.push("jobs.scheduled_date = ?");
     params.push(date);
+  } else {
+    // The 72-hour drop-off only applies to the default, unfiltered Jobs
+    // list — a specific date lookup (the Calendar asking "what happened
+    // on this day") should keep showing exactly what happened that day,
+    // no matter how long ago.
+    conditions.push("NOT (jobs.status = 'complete' AND jobs.completed_at IS NOT NULL AND jobs.completed_at <= datetime('now', '-72 hours'))");
+  }
+  if (conditions.length > 0) {
+    sql += " WHERE " + conditions.join(" AND ");
   }
   sql += " ORDER BY jobs.scheduled_date ASC, jobs.scheduled_time_slot ASC";
   const jobs = db.prepare(sql).all(...params).map((j) => ({ ...j, equipment_ids: JSON.parse(j.equipment_ids || "[]") }));
@@ -242,6 +253,14 @@ router.patch("/:id", async (req, res) => {
 
   if (req.body.status && req.body.status !== existing.status) {
     logActivity("job", req.params.id, `Status changed: ${existing.status} \u2192 ${req.body.status}`, req.user && req.user.name);
+    if (req.body.status === "complete") {
+      db.prepare("UPDATE jobs SET completed_at = datetime('now') WHERE id = ?").run(req.params.id);
+    } else if (existing.status === "complete") {
+      // Moved back out of Complete (e.g. corrected by mistake) — clears
+      // the 72-hour clock so it doesn't immediately vanish again the
+      // moment it's marked complete a second time for real.
+      db.prepare("UPDATE jobs SET completed_at = NULL WHERE id = ?").run(req.params.id);
+    }
   }
 
   if (req.body.scheduled_date) {
@@ -310,6 +329,7 @@ router.delete("/:id", (req, res) => {
   const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(req.params.id);
   if (!job) return res.status(404).json({ error: "Job not found" });
   db.prepare("DELETE FROM jobs WHERE id = ?").run(req.params.id);
+  logActivity("deal", job.deal_id, `Job #${req.params.id} deleted (was ${job.status})`, req.user && req.user.name);
   res.json({ ok: true });
 });
 
