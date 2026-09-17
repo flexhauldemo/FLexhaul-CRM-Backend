@@ -15,7 +15,7 @@
 //               this is a real finished transaction, not a dead lead.
 
 const express = require("express");
-const { db } = require("../db");
+const { db, sweepDueArchiving } = require("../db");
 const { requireAdmin } = require("../middleware/auth");
 
 const router = express.Router();
@@ -79,6 +79,7 @@ function getCompletedDeals() {
 }
 
 router.get("/", (req, res) => {
+  sweepDueArchiving();
   const lost = getLostDeals();
   const completed = getCompletedDeals();
 
