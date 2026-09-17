@@ -7,6 +7,19 @@ const bcrypt = require("bcryptjs");
 
 const { db } = require("./db");
 const { requireAuth } = require("./middleware/auth");
+const rateLimit = require("express-rate-limit");
+
+// The public inquiry form and public share links (estimate/invoice
+// pages) have no login at all by design — this just stops a script
+// from hammering them, without getting in the way of a real customer
+// checking their own estimate or submitting a real quote request.
+const publicLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Please wait a few minutes and try again." },
+});
 
 const authRoutes = require("./routes/auth");
 const dashboardRoutes = require("./routes/dashboard");
@@ -48,10 +61,11 @@ app.use(
 
 app.use(express.json({ limit: "2mb" }));
 
-// Uploaded photos/documents are served statically. In production, put
-// this behind the same auth as the rest of the app if the files are
-// sensitive (e.g. via a signed-URL proxy) — see README.
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+// Uploaded photos/documents (job photos, permits, insurance certs) are
+// only ever reachable by a logged-in staff account now — previously
+// anyone with a direct link (or who guessed/enumerated a filename)
+// could view them with no login at all.
+app.use("/uploads", requireAuth, express.static(path.join(__dirname, "uploads")));
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
@@ -60,9 +74,9 @@ app.get("/api/health", (req, res) => res.json({ ok: true }));
 // called directly from the public website or a texted/emailed link,
 // before anyone has logged into anything.
 app.use("/api/auth", authRoutes);
-app.use("/api/public/inquiries", publicInquiriesRoutes);
-app.use("/api/public/availability", publicAvailabilityRoutes);
-app.use("/api/public", publicShareRoutes);
+app.use("/api/public/inquiries", publicLimiter, publicInquiriesRoutes);
+app.use("/api/public/availability", publicLimiter, publicAvailabilityRoutes);
+app.use("/api/public", publicLimiter, publicShareRoutes);
 
 app.use("/api/dashboard", requireAuth, dashboardRoutes);
 app.use("/api/customers", requireAuth, customerRoutes);
