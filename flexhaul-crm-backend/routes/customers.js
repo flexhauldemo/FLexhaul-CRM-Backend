@@ -165,4 +165,70 @@ router.patch("/:id", (req, res) => {
   res.json({ customer: db.prepare("SELECT * FROM customers WHERE id = ?").get(req.params.id) });
 });
 
+// POST /api/customers/:id/reassign-deals — moves one or more deals from
+// this customer to a different, existing customer. Built for exactly
+// the situation where an estimate already got accepted against a
+// profile that turned out to be incomplete or a duplicate: rather than
+// losing that history, it gets re-pointed at the correct customer
+// record, with every estimate, job, invoice, and document underneath
+// it following along untouched — nothing is copied or recreated, only
+// the ownership (deals.customer_id) changes.
+router.post("/:id/reassign-deals", (req, res) => {
+  const source = db.prepare("SELECT * FROM customers WHERE id = ?").get(req.params.id);
+  if (!source) return res.status(404).json({ error: "Customer not found" });
+
+  const targetId = req.body.target_customer_id;
+  if (!targetId) return res.status(400).json({ error: "target_customer_id is required" });
+  if (String(targetId) === String(req.params.id)) {
+    return res.status(400).json({ error: "Can't reassign a customer's deals to themselves." });
+  }
+  const target = db.prepare("SELECT * FROM customers WHERE id = ?").get(targetId);
+  if (!target) return res.status(400).json({ error: "target_customer_id does not match an existing customer" });
+
+  // Only ever moves deals that actually belong to the source customer —
+  // an id list from the client is never trusted blindly. Omitting
+  // deal_ids entirely reassigns everything this customer has, which is
+  // the common case (merging a duplicate profile into the real one).
+  const dealIds = Array.isArray(req.body.deal_ids) && req.body.deal_ids.length > 0
+    ? req.body.deal_ids
+    : db.prepare("SELECT id FROM deals WHERE customer_id = ?").all(req.params.id).map((d) => d.id);
+
+  let moved = 0;
+  dealIds.forEach((dealId) => {
+    const result = db
+      .prepare("UPDATE deals SET customer_id = ?, updated_at = datetime('now') WHERE id = ? AND customer_id = ?")
+      .run(targetId, dealId, req.params.id);
+    if (result.changes > 0) {
+      moved++;
+      logActivity("deal", dealId, `Reassigned from "${source.name}" to "${target.name}"`, req.user && req.user.name);
+    }
+  });
+
+  logActivity("customer", req.params.id, `${moved} deal${moved === 1 ? "" : "s"} reassigned to "${target.name}"`, req.user && req.user.name);
+  logActivity("customer", targetId, `${moved} deal${moved === 1 ? "" : "s"} reassigned from "${source.name}"`, req.user && req.user.name);
+
+  res.json({ ok: true, moved, target_customer: target });
+});
+
+// DELETE /api/customers/:id — only ever allowed once this customer has
+// zero deals attached. This is deliberately not a cascading delete: the
+// realistic case this exists for is cleaning up an empty duplicate
+// profile *after* reassigning its work elsewhere with the endpoint
+// above, not erasing a customer along with real history in one step.
+router.delete("/:id", (req, res) => {
+  const existing = db.prepare("SELECT * FROM customers WHERE id = ?").get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "Customer not found" });
+
+  const dealCount = db.prepare("SELECT COUNT(*) AS n FROM deals WHERE customer_id = ?").get(req.params.id).n;
+  if (dealCount > 0) {
+    return res.status(400).json({
+      error: `This customer still has ${dealCount} deal${dealCount === 1 ? "" : "s"} attached. Reassign them to another customer first, then erase.`,
+      dealCount,
+    });
+  }
+
+  db.prepare("DELETE FROM customers WHERE id = ?").run(req.params.id);
+  res.json({ ok: true });
+});
+
 module.exports = router;
