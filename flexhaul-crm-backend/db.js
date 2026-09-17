@@ -237,6 +237,81 @@ if (!dealsColumns3.includes("lost_reason")) {
   db.exec("ALTER TABLE deals ADD COLUMN lost_reason TEXT;");
 }
 
+// pending_archive_at is the 72-hour countdown: set the moment a deal is
+// marked Lost, or an invoice is paid in full, rather than archiving
+// immediately. That gives a real window to catch a mistake, fix bad
+// contact info, or try to win the customer back before the deal
+// disappears into the Archive on its own. archived_at (above) is still
+// the final, authoritative flag — it gets set either by the sweep below
+// once the 72 hours actually elapse, or immediately if someone manually
+// archives early.
+if (!dealsColumns3.includes("pending_archive_at")) {
+  db.exec("ALTER TABLE deals ADD COLUMN pending_archive_at TEXT;");
+}
+
+// One-time backfill for deals that were already sitting at stage='lost'
+// (or already had an invoice paid) from before this 72-hour system
+// existed — those never got a timer started, so without this they'd
+// stay stuck on the Pipeline forever. Treat them as already due: the
+// next sweep (see sweepDueArchiving below) finalizes them immediately
+// rather than making anyone click through each one by hand.
+db.prepare(
+  `UPDATE deals SET pending_archive_at = datetime('now')
+   WHERE archived_at IS NULL AND pending_archive_at IS NULL AND stage = 'lost'`
+).run();
+db.prepare(
+  `UPDATE deals SET pending_archive_at = datetime('now')
+   WHERE deals.archived_at IS NULL AND deals.pending_archive_at IS NULL
+     AND EXISTS (
+       SELECT 1 FROM jobs JOIN invoices ON invoices.job_id = jobs.id
+       WHERE jobs.deal_id = deals.id AND invoices.status = 'paid'
+     )`
+).run();
+
+const jobsColumns3 = db.prepare("PRAGMA table_info(jobs)").all().map((c) => c.name);
+if (!jobsColumns3.includes("completed_at")) {
+  db.exec("ALTER TABLE jobs ADD COLUMN completed_at TEXT;");
+  // Same backfill logic — a job already sitting at status='complete'
+  // from before this column existed should count its 72-hour clock as
+  // already up, not restart from zero the moment this deploys.
+  db.exec("UPDATE jobs SET completed_at = datetime('now') WHERE status = 'complete' AND completed_at IS NULL;");
+}
+
+// Finds every deal whose 72-hour window has actually elapsed and
+// finalizes it: a Lost deal has its estimate cleared (same rule as an
+// immediate archive always followed); a Won/Paid deal keeps everything
+// exactly as it is. Called at the top of any endpoint that lists or
+// counts deals, so archiving happens the moment it's due, without
+// depending on a cron job or background worker actually being set up
+// and firing on schedule.
+function sweepDueArchiving() {
+  const due = db
+    .prepare(
+      `SELECT id, stage FROM deals
+       WHERE archived_at IS NULL AND pending_archive_at IS NOT NULL AND pending_archive_at <= datetime('now')`
+    )
+    .all();
+
+  due.forEach((deal) => {
+    if (deal.stage === "lost") {
+      const deleted = db.prepare("DELETE FROM estimates WHERE deal_id = ?").run(deal.id);
+      logActivity(
+        "deal",
+        deal.id,
+        deleted.changes > 0
+          ? `Auto-archived after 72 hours \u2014 ${deleted.changes} estimate${deleted.changes === 1 ? "" : "s"} cleared`
+          : "Auto-archived after 72 hours",
+        "system"
+      );
+    } else {
+      logActivity("deal", deal.id, "Auto-archived after 72 hours", "system");
+    }
+    db.prepare("UPDATE deals SET archived_at = datetime('now') WHERE id = ?").run(deal.id);
+  });
+
+  return due.length;
+}
+
 // Backfill share_token for any estimates created before this feature
 // existed, so the public link works for old data too, not just new.
 db.exec(`
@@ -460,4 +535,4 @@ function syncDealValue(dealId) {
   db.prepare("UPDATE deals SET estimated_value = ?, updated_at = datetime('now') WHERE id = ?").run(value, dealId);
 }
 
-module.exports = { db, logActivity, reseedPriceCatalog, advanceDealStage, syncDealValue };
+module.exports = { db, logActivity, reseedPriceCatalog, advanceDealStage, syncDealValue, sweepDueArchiving };
