@@ -138,8 +138,13 @@ router.patch("/:id", async (req, res) => {
         // Nothing is deleted here (unlike a Lost deal): the estimate, the
         // job, this invoice, and every document stay attached exactly as
         // they are, since this is now a real completed job record.
-        db.prepare("UPDATE deals SET archived_at = datetime('now') WHERE id = ? AND archived_at IS NULL").run(job.deal_id);
-        logActivity("deal", job.deal_id, "Invoice paid in full \u2014 archived as Completed", req.user && req.user.name);
+        // Fully paid means fully done — start the same 72-hour countdown
+        // to archiving that a Lost deal gets, rather than archiving the
+        // instant the last dollar comes in. Nothing is deleted either
+        // way here (unlike a Lost deal): the estimate, the job, this
+        // invoice, and every document stay attached exactly as they are.
+        db.prepare("UPDATE deals SET pending_archive_at = datetime('now', '+72 hours') WHERE id = ? AND archived_at IS NULL AND pending_archive_at IS NULL").run(job.deal_id);
+        logActivity("deal", job.deal_id, "Invoice paid in full \u2014 will archive automatically in 72 hours", req.user && req.user.name);
 
         // Completed AND paid, in the same instant — the exact moment to
         // ask for a Google review, while the job's still fresh. Guarded
@@ -166,6 +171,20 @@ router.patch("/:id", async (req, res) => {
   }
 
   res.json({ invoice: db.prepare("SELECT * FROM invoices WHERE id = ?").get(req.params.id) });
+});
+
+// DELETE /api/invoices/:id — for test invoices and duplicates. Only
+// ever allowed on an unpaid one — a paid invoice is a real financial
+// record, not something to erase.
+router.delete("/:id", (req, res) => {
+  const existing = db.prepare("SELECT * FROM invoices WHERE id = ?").get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "Invoice not found" });
+  if (existing.status === "paid") {
+    return res.status(400).json({ error: "This invoice is marked paid \u2014 mark it unpaid first if it genuinely needs to be deleted." });
+  }
+  db.prepare("DELETE FROM invoices WHERE id = ?").run(req.params.id);
+  logActivity("job", existing.job_id, `Invoice #${req.params.id} deleted (was ${existing.status}, $${Number(existing.amount).toFixed(2)})`, req.user && req.user.name);
+  res.json({ ok: true });
 });
 
 module.exports = router;
