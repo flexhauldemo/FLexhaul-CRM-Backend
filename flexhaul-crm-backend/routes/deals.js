@@ -1,6 +1,6 @@
 // routes/deals.js
 const express = require("express");
-const { db, logActivity, syncDealValue } = require("../db");
+const { db, logActivity, syncDealValue, sweepDueArchiving } = require("../db");
 const { requireAdmin } = require("../middleware/auth");
 
 const router = express.Router();
@@ -29,6 +29,7 @@ router.post("/resync-values", requireAdmin, (req, res) => {
 // GET /api/deals — all deals, joined with customer name, optionally filtered by stage.
 // This is what powers the Kanban pipeline view.
 router.get("/", (req, res) => {
+  sweepDueArchiving();
   const { stage } = req.query;
   let rows;
   const base = `
@@ -184,27 +185,68 @@ router.patch("/:id", (req, res) => {
       }
     }
 
-    // A deal marked Lost leaves the Pipeline immediately. The itemized
-    // estimate (pricing, line items — what was actually quoted) is
-    // deleted rather than kept, since a declined quote isn't useful to
-    // hang onto in detail. The customer record and the deal itself stay,
-    // along with why it was lost, so there's still something to work
-    // with for a future win-back attempt.
+    // A deal marked Lost gets a 72-hour countdown instead of archiving
+    // immediately — long enough to catch a mistake, fix bad contact
+    // info, or try to win the customer back. The estimate isn't cleared
+    // yet either; that only happens once the window actually elapses
+    // (see sweepDueArchiving in db.js), or immediately if someone
+    // manually erases or archives it sooner via the endpoints below.
     if (req.body.stage === "lost") {
-      const deletedEstimates = db.prepare("DELETE FROM estimates WHERE deal_id = ?").run(req.params.id);
-      db.prepare("UPDATE deals SET archived_at = datetime('now') WHERE id = ?").run(req.params.id);
+      db.prepare("UPDATE deals SET pending_archive_at = datetime('now', '+72 hours') WHERE id = ?").run(req.params.id);
       logActivity(
         "deal",
         req.params.id,
-        deletedEstimates.changes > 0
-          ? `Marked Lost \u2014 archived, and ${deletedEstimates.changes} estimate${deletedEstimates.changes === 1 ? "" : "s"} cleared`
-          : "Marked Lost \u2014 archived",
+        "Marked Lost \u2014 will archive automatically in 72 hours unless erased or moved sooner",
         req.user && req.user.name
       );
     }
   }
 
   res.json({ deal: db.prepare("SELECT * FROM deals WHERE id = ?").get(req.params.id), auto_created: autoCreated });
+});
+
+// DELETE /api/deals/:id — permanently erases a Lost deal: the deal
+// itself, its estimates, its jobs, and (through jobs) any invoices or
+// documents attached — all cascade automatically at the database level.
+// Restricted to Lost deals specifically. A Won/Invoiced/Complete deal
+// is real transaction history, not something to ever hard-delete —
+// use archive-now below for those instead.
+router.delete("/:id", (req, res) => {
+  const existing = db.prepare("SELECT * FROM deals WHERE id = ?").get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "Deal not found" });
+  if (existing.stage !== "lost") {
+    return res.status(400).json({ error: "Only deals marked Lost can be erased. Won, Scheduled, Complete, and Invoiced deals are real transaction history — archive them instead." });
+  }
+  db.prepare("DELETE FROM deals WHERE id = ?").run(req.params.id);
+  logActivity("customer", existing.customer_id, `A lost lead for this customer was permanently erased`, req.user && req.user.name);
+  res.json({ ok: true });
+});
+
+// POST /api/deals/:id/archive-now — skips the rest of the 72-hour wait
+// and finalizes archiving immediately. Only valid for a deal that's
+// already in that waiting state (pending_archive_at set, not yet
+// archived) — i.e. already Lost or already paid in full.
+router.post("/:id/archive-now", (req, res) => {
+  const existing = db.prepare("SELECT * FROM deals WHERE id = ?").get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "Deal not found" });
+  if (existing.archived_at) return res.status(400).json({ error: "This deal is already archived." });
+  if (!existing.pending_archive_at) {
+    return res.status(400).json({ error: "This deal isn't waiting to archive — it needs to be Lost or fully paid first." });
+  }
+
+  if (existing.stage === "lost") {
+    const deleted = db.prepare("DELETE FROM estimates WHERE deal_id = ?").run(req.params.id);
+    logActivity(
+      "deal",
+      req.params.id,
+      deleted.changes > 0 ? `Moved to Archive early \u2014 ${deleted.changes} estimate${deleted.changes === 1 ? "" : "s"} cleared` : "Moved to Archive early",
+      req.user && req.user.name
+    );
+  } else {
+    logActivity("deal", req.params.id, "Moved to Archive early", req.user && req.user.name);
+  }
+  db.prepare("UPDATE deals SET archived_at = datetime('now') WHERE id = ?").run(req.params.id);
+  res.json({ ok: true, deal: db.prepare("SELECT * FROM deals WHERE id = ?").get(req.params.id) });
 });
 
 module.exports = router;
