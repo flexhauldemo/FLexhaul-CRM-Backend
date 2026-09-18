@@ -129,17 +129,39 @@ router.get("/", (req, res) => {
     .all();
 
   // Job costing — estimate value vs. what the job actually cost, across
-  // every job that's had a real cost logged. NULL actual_cost jobs are
-  // excluded rather than treated as $0, since "not entered yet" and
-  // "cost nothing" are very different things.
+  // every job that's had a real cost logged. A job counts as "costed"
+  // once it has either a real expense-ledger entry OR the older,
+  // single lump-sum actual_cost field some jobs may still carry from
+  // before the expense ledger existed — the ledger sum wins whenever
+  // both exist, since it's the more accurate, itemized figure. NULL/no
+  // data jobs are excluded rather than treated as $0, since "not
+  // entered yet" and "cost nothing" are very different things.
   const jobCosting = db
     .prepare(
       `SELECT COUNT(*) AS jobs_costed,
-              COALESCE(SUM(invoices.amount),0) AS total_billed,
-              COALESCE(SUM(jobs.actual_cost),0) AS total_actual_cost
+              COALESCE(SUM(invoices.amount), 0) AS total_billed,
+              COALESCE(SUM(
+                COALESCE(
+                  (SELECT SUM(expenses.amount) FROM expenses WHERE expenses.job_id = jobs.id),
+                  jobs.actual_cost
+                )
+              ), 0) AS total_actual_cost
        FROM jobs
        JOIN invoices ON invoices.job_id = jobs.id
-       WHERE jobs.actual_cost IS NOT NULL`
+       WHERE jobs.actual_cost IS NOT NULL
+          OR EXISTS (SELECT 1 FROM expenses WHERE expenses.job_id = jobs.id)`
+    )
+    .get();
+
+  // Total spend this calendar month across every logged expense,
+  // regardless of whether it's tied to a job — fuel, subscriptions,
+  // insurance, and anything else that isn't job-specific still counts
+  // as real money going out, and wasn't visible anywhere before.
+  const expensesThisMonth = db
+    .prepare(
+      `SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS n
+       FROM expenses
+       WHERE strftime('%Y-%m', expense_date) = strftime('%Y-%m', 'now')`
     )
     .get();
 
@@ -163,6 +185,7 @@ router.get("/", (req, res) => {
       total_actual_cost: jobCosting.total_actual_cost,
       margin: jobCosting.total_billed - jobCosting.total_actual_cost,
     },
+    expenses_this_month: { total: expensesThisMonth.total, count: expensesThisMonth.n },
   });
 });
 
