@@ -277,6 +277,35 @@ if (!jobsColumns3.includes("completed_at")) {
   db.exec("UPDATE jobs SET completed_at = datetime('now') WHERE status = 'complete' AND completed_at IS NULL;");
 }
 
+// Expenses — a real ledger (category, date, optional receipt, optional
+// job link) rather than the single lump-sum jobs.actual_cost field that
+// existed before. category is a plain TEXT column on purpose, not a
+// constrained enum or a separate lookup table: the category list lives
+// in one place in routes/expenses.js, so adding a new one later is a
+// one-line change, not a migration. job_id uses ON DELETE SET NULL
+// (not CASCADE, unlike documents/estimates) — an expense is real money
+// that was actually spent; deleting the job it was attached to should
+// never make the expense itself disappear, only unlink it.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS expenses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    amount REAL NOT NULL,
+    expense_date TEXT NOT NULL DEFAULT (date('now')),
+    category TEXT NOT NULL DEFAULT 'other',
+    vendor TEXT,
+    notes TEXT,
+    job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+    payment_method TEXT,
+    receipt_file_url TEXT,
+    receipt_original_name TEXT,
+    created_by TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+db.exec("CREATE INDEX IF NOT EXISTS idx_expenses_job ON expenses(job_id);");
+db.exec("CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(expense_date);");
+
 // Finds every deal whose 72-hour window has actually elapsed and
 // finalizes it: a Lost deal has its estimate cleared (same rule as an
 // immediate archive always followed); a Won/Paid deal keeps everything
